@@ -39,6 +39,7 @@ overrides:
     conf:
       global:
         mon_warn_on_pool_no_app: false
+        mon pg warn min per osd: 0
       mon:
         mon debug unsafe allow tier with nonempty snaps: true
       osd:
@@ -163,6 +164,9 @@ upgrade-sequence_nautilus:
    - sleep:
        duration: 30
    - ceph.restart: [osd.5]
+   - sleep:
+       duration: 60
+   - ceph.restart: [mgr.x]
    - sleep:
        duration: 60
    - ceph.restart: [mon.a]

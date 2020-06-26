@@ -446,6 +446,9 @@ public:
     bool transaction_applied,
     ObjectStore::Transaction &t,
     bool async = false) override {
+    if (is_primary()) {
+      ceph_assert(trim_to <= last_update_ondisk);
+    }
     if (hset_history) {
       info.hit_set = *hset_history;
     }
@@ -1126,7 +1129,7 @@ protected:
 				  PGBackend::RecoveryHandle *h,
 				  bool *work_started);
 
-  void finish_degraded_object(const hobject_t& oid) override;
+  void finish_degraded_object(const hobject_t oid) override;
 
   // Cancels/resets pulls from peer
   void check_recovery_sources(const OSDMapRef& map) override ;

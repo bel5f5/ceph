@@ -6,6 +6,13 @@ if(WITH_RADOSGW_AMQP_ENDPOINT)
   add_library(amqp_mock STATIC ${amqp_mock_src})
 endif()
 
+if(WITH_RADOSGW_KAFKA_ENDPOINT)
+  # kafka stub library
+  set(kafka_stub_src
+    kafka_stub.cc)
+  add_library(kafka_stub STATIC ${kafka_stub_src})
+endif()
+
 #unittest_rgw_bencode
 add_executable(unittest_rgw_bencode test_rgw_bencode.cc)
 add_ceph_unittest(unittest_rgw_bencode)
@@ -157,5 +164,16 @@ endif()
 add_executable(unittest_rgw_xml test_rgw_xml.cc)
 add_ceph_unittest(unittest_rgw_xml)
 
-target_link_libraries(unittest_rgw_xml rgw_a ${EXPAT_LIBRARIES})
+target_link_libraries(unittest_rgw_xml ${rgw_libs} ${EXPAT_LIBRARIES})
 
+# unittest_rgw_arn
+add_executable(unittest_rgw_arn test_rgw_arn.cc)
+add_ceph_unittest(unittest_rgw_arn)
+
+target_link_libraries(unittest_rgw_arn ${rgw_libs})
+
+# unittest_rgw_url
+add_executable(unittest_rgw_url test_rgw_url.cc)
+add_ceph_unittest(unittest_rgw_url)
+
+target_link_libraries(unittest_rgw_url ${rgw_libs})

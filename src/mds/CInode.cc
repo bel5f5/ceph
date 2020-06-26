@@ -1479,7 +1479,7 @@ void InodeStoreBase::decode_bare(bufferlist::const_iterator &bl,
     symlink = std::string_view(tmp);
   }
   decode(dirfragtree, bl);
-  decode(xattrs, bl);
+  decode_noshare(xattrs, bl);
   decode(snap_blob, bl);
 
   decode(old_inodes, bl);
@@ -2817,7 +2817,8 @@ void CInode::decode_snap_blob(const bufferlist& snapbl)
       }
     }
     dout(20) << __func__ << " " << *snaprealm << dendl;
-  } else if (snaprealm) {
+  } else if (snaprealm &&
+	     !is_root() && !is_mdsdir()) { // see https://tracker.ceph.com/issues/42675
     ceph_assert(mdcache->mds->is_any_replay());
     snaprealm->merge_to(NULL);
   }
@@ -3794,7 +3795,7 @@ void CInode::_decode_base(bufferlist::const_iterator& p)
     symlink = std::string_view(tmp);
   }
   decode(dirfragtree, p);
-  decode(xattrs, p);
+  decode_noshare(xattrs, p);
   decode(old_inodes, p);
   decode(damage_flags, p);
   decode_snap(p);

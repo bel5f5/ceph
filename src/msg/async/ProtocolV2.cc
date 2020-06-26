@@ -145,7 +145,7 @@ void ProtocolV2::reset_session() {
 
   connection->dispatch_queue->discard_queue(connection->conn_id);
   discard_out_queue();
-  connection->outcoming_bl.clear();
+  connection->outgoing_bl.clear();
 
   connection->dispatch_queue->queue_remote_reset(connection);
 
@@ -221,12 +221,36 @@ uint64_t ProtocolV2::discard_requeued_up_to(uint64_t out_seq, uint64_t seq) {
   return count;
 }
 
-void ProtocolV2::reset_recv_state() {
+void ProtocolV2::reset_security() {
+  ldout(cct, 5) << __func__ << dendl;
+
   auth_meta.reset(new AuthConnectionMeta);
-  session_stream_handlers.tx.reset(nullptr);
   session_stream_handlers.rx.reset(nullptr);
-  pre_auth.txbuf.clear();
+  session_stream_handlers.tx.reset(nullptr);
   pre_auth.rxbuf.clear();
+  pre_auth.txbuf.clear();
+}
+
+// it's expected the `write_lock` is held while calling this method.
+void ProtocolV2::reset_recv_state() {
+  ldout(cct, 5) << __func__ << dendl;
+
+  if (!connection->center->in_thread()) {
+    // execute in the same thread that uses the rx/tx handlers. We need
+    // to do the warp because holding `write_lock` is not enough as
+    // `write_event()` unlocks it just before calling `write_message()`.
+    // `submit_to()` here is NOT blocking.
+    connection->center->submit_to(connection->center->get_id(), [this] {
+      ldout(cct, 5) << "reset_recv_state (warped) reseting crypto handlers"
+                    << dendl;
+      // Possibly unnecessary. See the comment in `deactivate_existing`.
+      std::lock_guard<std::mutex> l(connection->lock);
+      std::lock_guard<std::mutex> wl(connection->write_lock);
+      reset_security();
+    }, /* nowait = */true);
+  } else {
+    reset_security();
+  }
 
   // clean read and write callbacks
   connection->pendingReadLen.reset();
@@ -502,8 +526,8 @@ ssize_t ProtocolV2::write_message(Message *m, bool more) {
   ceph_msg_header2 header2{header.seq,        header.tid,
                            header.type,       header.priority,
                            header.version,
-                           0,                 header.data_off,
-                           ack_seq,
+                           init_le32(0),      header.data_off,
+                           init_le64(ack_seq),
                            footer.flags,      header.compat_version,
                            header.reserved};
 
@@ -512,7 +536,10 @@ ssize_t ProtocolV2::write_message(Message *m, bool more) {
 			     m->get_payload(),
 			     m->get_middle(),
 			     m->get_data());
-  connection->outcoming_bl.append(message.get_buffer(session_stream_handlers));
+  if (!append_frame(message)) {
+    m->put();
+    return -EILSEQ;
+  }
 
   ldout(cct, 5) << __func__ << " sending message m=" << m
                 << " seq=" << m->get_seq() << " " << *m << dendl;
@@ -522,14 +549,14 @@ ssize_t ProtocolV2::write_message(Message *m, bool more) {
                  << " src=" << entity_name_t(messenger->get_myname())
                  << " off=" << header2.data_off
                  << dendl;
-  ssize_t total_send_size = connection->outcoming_bl.length();
+  ssize_t total_send_size = connection->outgoing_bl.length();
   ssize_t rc = connection->_try_send(more);
   if (rc < 0) {
     ldout(cct, 1) << __func__ << " error sending " << m << ", "
                   << cpp_strerror(rc) << dendl;
   } else {
     connection->logger->inc(
-        l_msgr_send_bytes, total_send_size - connection->outcoming_bl.length());
+        l_msgr_send_bytes, total_send_size - connection->outgoing_bl.length());
     ldout(cct, 10) << __func__ << " sending " << m
                    << (rc ? " continuely." : " done.") << dendl;
   }
@@ -542,15 +569,17 @@ ssize_t ProtocolV2::write_message(Message *m, bool more) {
   return rc;
 }
 
-void ProtocolV2::append_keepalive() {
-  ldout(cct, 10) << __func__ << dendl;
-  auto keepalive_frame = KeepAliveFrame::Encode();
-  connection->outcoming_bl.append(keepalive_frame.get_buffer(session_stream_handlers));
-}
-
-void ProtocolV2::append_keepalive_ack(utime_t &timestamp) {
-  auto keepalive_ack_frame = KeepAliveFrameAck::Encode(timestamp);
-  connection->outcoming_bl.append(keepalive_ack_frame.get_buffer(session_stream_handlers));
+template <class F>
+bool ProtocolV2::append_frame(F& frame) {
+  ceph::bufferlist bl;
+  try {
+    bl = frame.get_buffer(session_stream_handlers);
+  } catch (ceph::crypto::onwire::TxHandlerError &e) {
+    ldout(cct, 1) << __func__ << " " << e.what() << dendl;
+    return false;
+  }
+  connection->outgoing_bl.append(bl);
+  return true;
 }
 
 void ProtocolV2::handle_message_ack(uint64_t seq) {
@@ -586,7 +615,15 @@ void ProtocolV2::write_event() {
   connection->write_lock.lock();
   if (can_write) {
     if (keepalive) {
-      append_keepalive();
+      ldout(cct, 10) << __func__ << " appending keepalive" << dendl;
+      auto keepalive_frame = KeepAliveFrame::Encode();
+      if (!append_frame(keepalive_frame)) {
+        connection->write_lock.unlock();
+        connection->lock.lock();
+        fault();
+        connection->lock.unlock();
+        return;
+      }
       keepalive = false;
     }
 
@@ -630,13 +667,16 @@ void ProtocolV2::write_event() {
       if (left) {
         ceph_le64 s;
         s = in_seq;
-        auto ack = AckFrame::Encode(in_seq);
-        connection->outcoming_bl.append(ack.get_buffer(session_stream_handlers));
         ldout(cct, 10) << __func__ << " try send msg ack, acked " << left
                        << " messages" << dendl;
-        ack_left -= left;
-        left = ack_left;
-        r = connection->_try_send(left);
+        auto ack_frame = AckFrame::Encode(in_seq);
+        if (append_frame(ack_frame)) {
+          ack_left -= left;
+          left = ack_left;
+          r = connection->_try_send(left);
+        } else {
+          r = -EILSEQ;
+        }
       } else if (is_queued()) {
         r = connection->_try_send();
       }
@@ -736,7 +776,13 @@ template <class F>
 CtPtr ProtocolV2::write(const std::string &desc,
                         CONTINUATION_TYPE<ProtocolV2> &next,
                         F &frame) {
-  ceph::bufferlist bl = frame.get_buffer(session_stream_handlers);
+  ceph::bufferlist bl;
+  try {
+    bl = frame.get_buffer(session_stream_handlers);
+  } catch (ceph::crypto::onwire::TxHandlerError &e) {
+    ldout(cct, 1) << __func__ << " " << e.what() << dendl;
+    return _fault();
+  }
   return write(desc, next, bl);
 }
 
@@ -1385,15 +1431,16 @@ CtPtr ProtocolV2::handle_message() {
                          current_header.type,
                          current_header.priority,
                          current_header.version,
-                         msg_frame.front_len(),
-                         msg_frame.middle_len(),
-                         msg_frame.data_len(),
+                         init_le32(msg_frame.front_len()),
+                         init_le32(msg_frame.middle_len()),
+                         init_le32(msg_frame.data_len()),
                          current_header.data_off,
                          peer_name,
                          current_header.compat_version,
                          current_header.reserved,
-                         0};
-  ceph_msg_footer footer{0, 0, 0, 0, current_header.flags};
+                         init_le32(0)};
+  ceph_msg_footer footer{init_le32(0), init_le32(0),
+	                 init_le32(0), init_le64(0), current_header.flags};
 
   Message *message = decode_message(cct, 0, header, footer,
       msg_frame.front(),
@@ -1630,7 +1677,11 @@ CtPtr ProtocolV2::handle_keepalive2(ceph::bufferlist &payload)
   ldout(cct, 30) << __func__ << " got KEEPALIVE2 tag ..." << dendl;
 
   connection->write_lock.lock();
-  append_keepalive_ack(keepalive_frame.timestamp());
+  auto keepalive_ack_frame = KeepAliveFrameAck::Encode(keepalive_frame.timestamp());
+  if (!append_frame(keepalive_ack_frame)) {
+    connection->write_lock.unlock();
+    return _fault();
+  }
   connection->write_lock.unlock();
 
   ldout(cct, 20) << __func__ << " got KEEPALIVE2 "
@@ -2657,15 +2708,18 @@ CtPtr ProtocolV2::reuse_connection(AsyncConnectionRef existing,
   }
   exproto->peer_global_seq = peer_global_seq;
 
+  ceph_assert(connection->center->in_thread());
   auto temp_cs = std::move(connection->cs);
   EventCenter *new_center = connection->center;
   Worker *new_worker = connection->worker;
+  // we can steal the session_stream_handlers under the assumption
+  // this happens in the event center's thread as there should be
+  // no user outside its boundaries (simlarly to e.g. outgoing_bl).
+  auto temp_stream_handlers = std::move(session_stream_handlers);
+  exproto->auth_meta = auth_meta;
 
   ldout(messenger->cct, 5) << __func__ << " stop myself to swap existing"
                            << dendl;
-
-  std::swap(exproto->session_stream_handlers, session_stream_handlers);
-  exproto->auth_meta = auth_meta;
 
   // avoid _stop shutdown replacing socket
   // queue a reset on the new connection, which we're dumping for the old
@@ -2687,14 +2741,25 @@ CtPtr ProtocolV2::reuse_connection(AsyncConnectionRef existing,
   ceph_assert(connection->recv_start == connection->recv_end);
 
   auto deactivate_existing = std::bind(
-      [existing, new_worker, new_center, exproto](ConnectedSocket &cs) mutable {
+      [ existing,
+        new_worker,
+        new_center,
+        exproto,
+        temp_stream_handlers=std::move(temp_stream_handlers)
+      ](ConnectedSocket &cs) mutable {
         // we need to delete time event in original thread
         {
           std::lock_guard<std::mutex> l(existing->lock);
           existing->write_lock.lock();
           exproto->requeue_sent();
-          existing->outcoming_bl.clear();
+          // XXX: do we really need the locking for `outgoing_bl`? There is
+          // a comment just above its definition saying "lockfree, only used
+          // in own thread". I'm following lockfull schema just in the case.
+          // From performance point of view it should be fine – this happens
+          // far away from hot paths.
+          existing->outgoing_bl.clear();
           existing->open_write = false;
+          exproto->session_stream_handlers = std::move(temp_stream_handlers);
           existing->write_lock.unlock();
           if (exproto->state == NONE) {
             existing->shutdown_socket();

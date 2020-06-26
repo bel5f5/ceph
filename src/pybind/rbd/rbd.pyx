@@ -97,6 +97,7 @@ cdef extern from "rbd/librbd.h" nogil:
         RBD_MAX_BLOCK_NAME_SIZE
         RBD_MAX_IMAGE_NAME_SIZE
 
+    ctypedef void* rados_t
     ctypedef void* rados_ioctx_t
     ctypedef void* rbd_image_t
     ctypedef void* rbd_image_options_t
@@ -152,6 +153,11 @@ cdef extern from "rbd/librbd.h" nogil:
         _RBD_MIRROR_MODE_DISABLED "RBD_MIRROR_MODE_DISABLED"
         _RBD_MIRROR_MODE_IMAGE "RBD_MIRROR_MODE_IMAGE"
         _RBD_MIRROR_MODE_POOL "RBD_MIRROR_MODE_POOL"
+
+    ctypedef enum rbd_mirror_peer_direction_t:
+        _RBD_MIRROR_PEER_DIRECTION_RX "RBD_MIRROR_PEER_DIRECTION_RX"
+        _RBD_MIRROR_PEER_DIRECTION_TX "RBD_MIRROR_PEER_DIRECTION_TX"
+        _RBD_MIRROR_PEER_DIRECTION_RX_TX "RBD_MIRROR_PEER_DIRECTION_RX_TX"
 
     ctypedef struct rbd_mirror_peer_t:
         char *uuid
@@ -340,8 +346,18 @@ cdef extern from "rbd/librbd.h" nogil:
                              size_t status_size)
     void rbd_migration_status_cleanup(rbd_image_migration_status_t *status)
 
+    int rbd_mirror_site_name_get(rados_t cluster, char *name, size_t *max_len)
+    int rbd_mirror_site_name_set(rados_t cluster, const char *name)
+
     int rbd_mirror_mode_get(rados_ioctx_t io, rbd_mirror_mode_t *mirror_mode)
     int rbd_mirror_mode_set(rados_ioctx_t io, rbd_mirror_mode_t mirror_mode)
+
+    int rbd_mirror_peer_bootstrap_create(rados_ioctx_t io_ctx, char *token,
+                                         size_t *max_len)
+    int rbd_mirror_peer_bootstrap_import(
+        rados_ioctx_t io_ctx, rbd_mirror_peer_direction_t direction,
+        const char *token)
+
     int rbd_mirror_peer_add(rados_ioctx_t io, char *uuid,
                             size_t uuid_max_length, const char *cluster_name,
                             const char *client_name)
@@ -648,6 +664,10 @@ RBD_MIRROR_MODE_DISABLED = _RBD_MIRROR_MODE_DISABLED
 RBD_MIRROR_MODE_IMAGE = _RBD_MIRROR_MODE_IMAGE
 RBD_MIRROR_MODE_POOL = _RBD_MIRROR_MODE_POOL
 
+RBD_MIRROR_PEER_DIRECTION_RX = _RBD_MIRROR_PEER_DIRECTION_RX
+RBD_MIRROR_PEER_DIRECTION_TX = _RBD_MIRROR_PEER_DIRECTION_TX
+RBD_MIRROR_PEER_DIRECTION_RX_TX = _RBD_MIRROR_PEER_DIRECTION_RX_TX
+
 RBD_MIRROR_IMAGE_DISABLING = _RBD_MIRROR_IMAGE_DISABLING
 RBD_MIRROR_IMAGE_ENABLED = _RBD_MIRROR_IMAGE_ENABLED
 RBD_MIRROR_IMAGE_DISABLED = _RBD_MIRROR_IMAGE_DISABLED
@@ -787,45 +807,52 @@ class Timeout(OSError):
 class DiskQuotaExceeded(OSError):
     pass
 
+class OperationNotSupported(OSError):
+    def __init__(self, message, errno=None):
+        super(OperationNotSupported, self).__init__(
+                "RBD operation not supported (%s)" % message, errno)
+
 class OperationCanceled(OSError):
     def __init__(self, message, errno=None):
         super(OperationCanceled, self).__init__(
                 "RBD operation canceled (%s)" % message, errno)
 
 cdef errno_to_exception = {
-    errno.EPERM     : PermissionError,
-    errno.ENOENT    : ImageNotFound,
-    errno.EIO       : IOError,
-    errno.ENOSPC    : NoSpace,
-    errno.EEXIST    : ImageExists,
-    errno.EINVAL    : InvalidArgument,
-    errno.EROFS     : ReadOnlyImage,
-    errno.EBUSY     : ImageBusy,
-    errno.ENOTEMPTY : ImageHasSnapshots,
-    errno.ENOSYS    : FunctionNotSupported,
-    errno.EDOM      : ArgumentOutOfRange,
-    errno.ESHUTDOWN : ConnectionShutdown,
-    errno.ETIMEDOUT : Timeout,
-    errno.EDQUOT    : DiskQuotaExceeded,
-    ECANCELED       : OperationCanceled,
+    errno.EPERM      : PermissionError,
+    errno.ENOENT     : ImageNotFound,
+    errno.EIO        : IOError,
+    errno.ENOSPC     : NoSpace,
+    errno.EEXIST     : ImageExists,
+    errno.EINVAL     : InvalidArgument,
+    errno.EROFS      : ReadOnlyImage,
+    errno.EBUSY      : ImageBusy,
+    errno.ENOTEMPTY  : ImageHasSnapshots,
+    errno.ENOSYS     : FunctionNotSupported,
+    errno.EDOM       : ArgumentOutOfRange,
+    errno.ESHUTDOWN  : ConnectionShutdown,
+    errno.ETIMEDOUT  : Timeout,
+    errno.EDQUOT     : DiskQuotaExceeded,
+    errno.EOPNOTSUPP : OperationNotSupported,
+    ECANCELED        : OperationCanceled,
 }
 
 cdef group_errno_to_exception = {
-    errno.EPERM     : PermissionError,
-    errno.ENOENT    : ObjectNotFound,
-    errno.EIO       : IOError,
-    errno.ENOSPC    : NoSpace,
-    errno.EEXIST    : ObjectExists,
-    errno.EINVAL    : InvalidArgument,
-    errno.EROFS     : ReadOnlyImage,
-    errno.EBUSY     : ImageBusy,
-    errno.ENOTEMPTY : ImageHasSnapshots,
-    errno.ENOSYS    : FunctionNotSupported,
-    errno.EDOM      : ArgumentOutOfRange,
-    errno.ESHUTDOWN : ConnectionShutdown,
-    errno.ETIMEDOUT : Timeout,
-    errno.EDQUOT    : DiskQuotaExceeded,
-    ECANCELED       : OperationCanceled,
+    errno.EPERM      : PermissionError,
+    errno.ENOENT     : ObjectNotFound,
+    errno.EIO        : IOError,
+    errno.ENOSPC     : NoSpace,
+    errno.EEXIST     : ObjectExists,
+    errno.EINVAL     : InvalidArgument,
+    errno.EROFS      : ReadOnlyImage,
+    errno.EBUSY      : ImageBusy,
+    errno.ENOTEMPTY  : ImageHasSnapshots,
+    errno.ENOSYS     : FunctionNotSupported,
+    errno.EDOM       : ArgumentOutOfRange,
+    errno.ESHUTDOWN  : ConnectionShutdown,
+    errno.ETIMEDOUT  : Timeout,
+    errno.EDQUOT     : DiskQuotaExceeded,
+    errno.EOPNOTSUPP : OperationNotSupported,
+    ECANCELED        : OperationCanceled,
 }
 
 cdef make_ex(ret, msg, exception_map=errno_to_exception):
@@ -844,6 +871,9 @@ cdef make_ex(ret, msg, exception_map=errno_to_exception):
     else:
         return OSError(msg, errno=ret)
 
+
+cdef rados_t convert_rados(rados.Rados rados) except? NULL:
+    return <rados_t>rados.cluster
 
 cdef rados_ioctx_t convert_ioctx(rados.Ioctx ioctx) except? NULL:
     return <rados_ioctx_t>ioctx.io
@@ -1027,7 +1057,7 @@ class RBD(object):
         rbd_version(&major, &minor, &extra)
         return (major, minor, extra)
 
-    def create(self, ioctx, name, size, order=None, old_format=True,
+    def create(self, ioctx, name, size, order=None, old_format=False,
                features=None, stripe_unit=None, stripe_count=None,
                data_pool=None):
         """
@@ -1637,6 +1667,50 @@ class RBD(object):
 
         return status
 
+    def mirror_site_name_get(self, rados):
+        """
+        Get the local cluster's friendly site name
+
+        :param rados: cluster connection
+        :type rados: :class: rados.Rados
+        :returns: str - local site name
+        """
+        cdef:
+            rados_t _rados = convert_rados(rados)
+            char *_site_name = NULL
+            size_t _max_size = 512
+        try:
+            while True:
+                _site_name = <char *>realloc_chk(_site_name, _max_size)
+                with nogil:
+                    ret = rbd_mirror_site_name_get(_rados, _site_name,
+                                                   &_max_size)
+                if ret >= 0:
+                    break
+                elif ret != -errno.ERANGE:
+                    raise make_ex(ret, 'error getting site name')
+            return decode_cstr(_site_name)
+        finally:
+            free(_site_name)
+
+    def mirror_site_name_set(self, rados, site_name):
+        """
+        Set the local cluster's friendly site name
+
+        :param rados: cluster connection
+        :type rados: :class: rados.Rados
+        :param site_name: friendly site name
+        :type str:
+        """
+        site_name = cstr(site_name, 'site_name')
+        cdef:
+            rados_t _rados = convert_rados(rados)
+            char *_site_name = site_name
+        with nogil:
+            ret = rbd_mirror_site_name_set(_rados, _site_name)
+        if ret != 0:
+            raise make_ex(ret, 'error setting mirror site name')
+
     def mirror_mode_get(self, ioctx):
         """
         Get pool mirror mode.
@@ -1670,6 +1744,55 @@ class RBD(object):
             ret = rbd_mirror_mode_set(_ioctx, _mirror_mode)
         if ret != 0:
             raise make_ex(ret, 'error setting mirror mode')
+
+    def mirror_peer_bootstrap_create(self, ioctx):
+        """
+        Creates a new RBD mirroring bootstrap token for an
+        external cluster.
+
+        :param ioctx: determines which RADOS pool is written
+        :type ioctx: :class:`rados.Ioctx`
+        :returns: str - bootstrap token
+        """
+        cdef:
+            rados_ioctx_t _ioctx = convert_ioctx(ioctx)
+            char *_token = NULL
+            size_t _max_size = 512
+        try:
+            while True:
+                _token = <char *>realloc_chk(_token, _max_size)
+                with nogil:
+                    ret = rbd_mirror_peer_bootstrap_create(_ioctx, _token,
+                                                           &_max_size)
+                if ret >= 0:
+                    break
+                elif ret != -errno.ERANGE:
+                    raise make_ex(ret, 'error creating bootstrap token')
+            return decode_cstr(_token)
+        finally:
+            free(_token)
+
+    def mirror_peer_bootstrap_import(self, ioctx, direction, token):
+        """
+        Import a bootstrap token from an external cluster to
+        auto-configure the mirror peer.
+
+        :param ioctx: determines which RADOS pool is written
+        :type ioctx: :class:`rados.Ioctx`
+        :param direction: mirror peer direction
+        :type direction: int
+        :param token: bootstrap token
+        :type token: str
+        """
+        token = cstr(token, 'token')
+        cdef:
+            rados_ioctx_t _ioctx = convert_ioctx(ioctx)
+            rbd_mirror_peer_direction_t _direction = direction
+            char *_token = token
+        with nogil:
+            ret = rbd_mirror_peer_bootstrap_import(_ioctx, _direction, _token)
+        if ret != 0:
+            raise make_ex(ret, 'error importing bootstrap token')
 
     def mirror_peer_add(self, ioctx, cluster_name, client_name):
         """
@@ -2747,6 +2870,13 @@ cdef class Group(object):
         if ret != 0:
             raise make_ex(ret, 'error rolling back group to snapshot', group_errno_to_exception)
 
+def requires_not_closed(f):
+    def wrapper(self, *args, **kwargs):
+        self.require_not_closed()
+        return f(self, *args, **kwargs)
+
+    return wrapper
+
 cdef class Image(object):
     """
     This class represents an RBD image. It is used to perform I/O on
@@ -2861,6 +2991,15 @@ cdef class Image(object):
         completion_obj.rbd_comp = completion
         return completion_obj
 
+    def require_not_closed(self):
+        """
+        Checks if the Image is not closed
+
+        :raises: :class:`InvalidArgument`
+        """
+        if self.closed:
+            raise InvalidArgument("image is closed")
+
     def close(self):
         """
         Release the resources used by this image object.
@@ -2881,6 +3020,7 @@ cdef class Image(object):
     def __repr__(self):
         return "rbd.Image(ioctx, %r)" % self.name
 
+    @requires_not_closed
     def resize(self, size, allow_shrink=True):
         """
         Change the size of the image, allow shrink.
@@ -2904,6 +3044,7 @@ cdef class Image(object):
         if ret < 0:
             raise make_ex(ret, 'error resizing image %s' % self.name)
 
+    @requires_not_closed
     def stat(self):
         """
         Get information about the image. Currently parent pool and
@@ -2945,6 +3086,7 @@ cdef class Image(object):
             'parent_name'       : info.parent_name
             }
 
+    @requires_not_closed
     def get_name(self):
         """
         Get the RBD image name
@@ -2967,6 +3109,7 @@ cdef class Image(object):
         finally:
             free(image_name)
 
+    @requires_not_closed
     def id(self):
         """
         Get the RBD v2 internal image id
@@ -2991,6 +3134,7 @@ cdef class Image(object):
         finally:
             free(image_id)
 
+    @requires_not_closed
     def block_name_prefix(self):
         """
         Get the RBD block name prefix
@@ -3015,6 +3159,7 @@ cdef class Image(object):
         finally:
             free(prefix)
 
+    @requires_not_closed
     def data_pool_id(self):
         """
         Get the pool id of the pool where the data of this RBD image is stored.
@@ -3023,12 +3168,17 @@ cdef class Image(object):
         """
         return rbd_get_data_pool_id(self.image)
 
-    def parent_info(self):
+    @requires_not_closed
+    def get_parent_image_spec(self):
         """
-        Get information about a cloned image's parent (if any)
+        Get spec of the cloned image's parent
 
-        :returns: tuple - ``(pool name, image name, snapshot name)`` components
-                  of the parent image
+        :returns: dict - contains the following keys:
+            * ``pool_name`` (str) - parent pool name
+            * ``pool_namespace`` (str) - parent pool namespace
+            * ``image_name`` (str) - parent image name
+            * ``snap_name`` (str) - parent snapshot name
+
         :raises: :class:`ImageNotFound` if the image doesn't have a parent
         """
         cdef:
@@ -3039,14 +3189,30 @@ cdef class Image(object):
         if ret != 0:
             raise make_ex(ret, 'error getting parent info for image %s' % self.name)
 
-        result = (decode_cstr(parent_spec.pool_name),
-                  decode_cstr(parent_spec.image_name),
-                  decode_cstr(snap_spec.name))
+        result = {'pool_name': decode_cstr(parent_spec.pool_name),
+                  'pool_namespace': decode_cstr(parent_spec.pool_namespace),
+                  'image_name': decode_cstr(parent_spec.image_name),
+                  'snap_name': decode_cstr(snap_spec.name)}
 
         rbd_linked_image_spec_cleanup(&parent_spec)
         rbd_snap_spec_cleanup(&snap_spec)
         return result
 
+    @requires_not_closed
+    def parent_info(self):
+        """
+        Deprecated. Use `get_parent_image_spec` instead.
+
+        Get information about a cloned image's parent (if any)
+
+        :returns: tuple - ``(pool name, image name, snapshot name)`` components
+                  of the parent image
+        :raises: :class:`ImageNotFound` if the image doesn't have a parent
+        """
+        parent = self.get_parent_image_spec()
+        return (parent['pool_name'], parent['image_name'], parent['snap_name'])
+
+    @requires_not_closed
     def parent_id(self):
         """
         Get image id of a cloned image's parent (if any)
@@ -3068,6 +3234,7 @@ cdef class Image(object):
         rbd_snap_spec_cleanup(&snap_spec)
         return result
 
+    @requires_not_closed
     def old_format(self):
         """
         Find out whether the image uses the old RBD format.
@@ -3081,6 +3248,7 @@ cdef class Image(object):
             raise make_ex(ret, 'error getting old_format for image %s' % (self.name))
         return old != 0
 
+    @requires_not_closed
     def size(self):
         """
         Get the size of the image. If open to a snapshot, returns the
@@ -3095,6 +3263,7 @@ cdef class Image(object):
             raise make_ex(ret, 'error getting size for image %s' % (self.name))
         return image_size
 
+    @requires_not_closed
     def features(self):
         """
         Get the features bitmask of the image.
@@ -3108,6 +3277,7 @@ cdef class Image(object):
             raise make_ex(ret, 'error getting features for image %s' % (self.name))
         return features
 
+    @requires_not_closed
     def update_features(self, features, enabled):
         """
         Update the features bitmask of the image by enabling/disabling
@@ -3129,6 +3299,7 @@ cdef class Image(object):
             raise make_ex(ret, 'error updating features for image %s' %
                                (self.name))
 
+    @requires_not_closed
     def op_features(self):
         """
         Get the op features bitmask of the image.
@@ -3142,6 +3313,7 @@ cdef class Image(object):
             raise make_ex(ret, 'error getting op features for image %s' % (self.name))
         return op_features
 
+    @requires_not_closed
     def overlap(self):
         """
         Get the number of overlapping bytes between the image and its parent
@@ -3158,6 +3330,7 @@ cdef class Image(object):
             raise make_ex(ret, 'error getting overlap for image %s' % (self.name))
         return overlap
 
+    @requires_not_closed
     def flags(self):
         """
         Get the flags bitmask of the image.
@@ -3171,6 +3344,7 @@ cdef class Image(object):
             raise make_ex(ret, 'error getting flags for image %s' % (self.name))
         return flags
 
+    @requires_not_closed
     def group(self):
         """
         Get information about the image's group.
@@ -3194,6 +3368,7 @@ cdef class Image(object):
         rbd_group_info_cleanup(&info, sizeof(info))
         return result
 
+    @requires_not_closed
     def is_exclusive_lock_owner(self):
         """
         Get the status of the image exclusive lock.
@@ -3207,6 +3382,7 @@ cdef class Image(object):
             raise make_ex(ret, 'error getting lock status for image %s' % (self.name))
         return owner == 1
 
+    @requires_not_closed
     def copy(self, dest_ioctx, dest_name, features=None, order=None,
              stripe_unit=None, stripe_count=None, data_pool=None):
         """
@@ -3263,6 +3439,7 @@ cdef class Image(object):
         if ret < 0:
             raise make_ex(ret, 'error copying image %s to %s' % (self.name, dest_name))
 
+    @requires_not_closed
     def deep_copy(self, dest_ioctx, dest_name, features=None, order=None,
                   stripe_unit=None, stripe_count=None, data_pool=None):
         """
@@ -3319,6 +3496,7 @@ cdef class Image(object):
         if ret < 0:
             raise make_ex(ret, 'error copying image %s to %s' % (self.name, dest_name))
 
+    @requires_not_closed
     def list_snaps(self):
         """
         Iterate over the snapshots of an image.
@@ -3327,6 +3505,7 @@ cdef class Image(object):
         """
         return SnapIterator(self)
 
+    @requires_not_closed
     def create_snap(self, name):
         """
         Create a snapshot of the image.
@@ -3342,6 +3521,7 @@ cdef class Image(object):
         if ret != 0:
             raise make_ex(ret, 'error creating snapshot %s from %s' % (name, self.name))
 
+    @requires_not_closed
     def rename_snap(self, srcname, dstname):
         """
         rename a snapshot of the image.
@@ -3362,6 +3542,7 @@ cdef class Image(object):
         if ret != 0:
             raise make_ex(ret, 'error renaming snapshot of %s from %s to %s' % (self.name, srcname, dstname))
 
+    @requires_not_closed
     def remove_snap(self, name):
         """
         Delete a snapshot of the image.
@@ -3377,6 +3558,7 @@ cdef class Image(object):
         if ret != 0:
             raise make_ex(ret, 'error removing snapshot %s from %s' % (name, self.name))
 
+    @requires_not_closed
     def remove_snap2(self, name, flags):
         """
         Delete a snapshot of the image.
@@ -3386,6 +3568,8 @@ cdef class Image(object):
         :type name: str
         :raises: :class:`IOError`, :class:`ImageBusy`
         """
+        self.require_not_closed()
+
         name = cstr(name, 'name')
         cdef:
             char *_name = name
@@ -3396,6 +3580,7 @@ cdef class Image(object):
         if ret != 0:
             raise make_ex(ret, 'error removing snapshot %s from %s with flags %llx' % (name, self.name, flags))
 
+    @requires_not_closed
     def remove_snap_by_id(self, snap_id):
         """
         Delete a snapshot of the image by its id.
@@ -3411,6 +3596,7 @@ cdef class Image(object):
         if ret != 0:
             raise make_ex(ret, 'error removing snapshot %s from %s' % (snap_id, self.name))
 
+    @requires_not_closed
     def rollback_to_snap(self, name):
         """
         Revert the image to its contents at a snapshot. This is a
@@ -3428,6 +3614,7 @@ cdef class Image(object):
         if ret != 0:
             raise make_ex(ret, 'error rolling back image %s to snapshot %s' % (self.name, name))
 
+    @requires_not_closed
     def protect_snap(self, name):
         """
         Mark a snapshot as protected. This means it can't be deleted
@@ -3444,6 +3631,7 @@ cdef class Image(object):
         if ret != 0:
             raise make_ex(ret, 'error protecting snapshot %s@%s' % (self.name, name))
 
+    @requires_not_closed
     def unprotect_snap(self, name):
         """
         Mark a snapshot unprotected. This allows it to be deleted if
@@ -3460,6 +3648,7 @@ cdef class Image(object):
         if ret != 0:
             raise make_ex(ret, 'error unprotecting snapshot %s@%s' % (self.name, name))
 
+    @requires_not_closed
     def is_protected_snap(self, name):
         """
         Find out whether a snapshot is protected from deletion.
@@ -3479,13 +3668,13 @@ cdef class Image(object):
             raise make_ex(ret, 'error checking if snapshot %s@%s is protected' % (self.name, name))
         return is_protected == 1
 
+    @requires_not_closed
     def get_snap_limit(self):
         """
         Get the snapshot limit for an image.
 
         :returns: int - the snapshot limit for an image
         """
-
         cdef:
             uint64_t limit
         with nogil:
@@ -3494,13 +3683,13 @@ cdef class Image(object):
             raise make_ex(ret, 'error getting snapshot limit for %s' % self.name)
         return limit
 
+    @requires_not_closed
     def set_snap_limit(self, limit):
         """
         Set the snapshot limit for an image.
 
         :param limit: the new limit to set
         """
-
         cdef:
             uint64_t _limit = limit
         with nogil:
@@ -3509,6 +3698,7 @@ cdef class Image(object):
             raise make_ex(ret, 'error setting snapshot limit for %s' % self.name)
         return ret
 
+    @requires_not_closed
     def get_snap_timestamp(self, snap_id):
         """
         Get the snapshot timestamp for an image.
@@ -3524,6 +3714,7 @@ cdef class Image(object):
             raise make_ex(ret, 'error getting snapshot timestamp for image: %s, snap_id: %d' % (self.name, snap_id))
         return datetime.utcfromtimestamp(timestamp.tv_sec)
 
+    @requires_not_closed
     def remove_snap_limit(self):
         """
         Remove the snapshot limit for an image, essentially setting
@@ -3535,6 +3726,7 @@ cdef class Image(object):
             raise make_ex(ret, 'error removing snapshot limit for %s' % self.name)
         return ret
 
+    @requires_not_closed
     def set_snap(self, name):
         """
         Set the snapshot to read from. Writes will raise ReadOnlyImage
@@ -3551,6 +3743,7 @@ cdef class Image(object):
         if ret != 0:
             raise make_ex(ret, 'error setting image %s to snapshot %s' % (self.name, name))
 
+    @requires_not_closed
     def set_snap_by_id(self, snap_id):
         """
         Set the snapshot to read from. Writes will raise ReadOnlyImage
@@ -3568,6 +3761,7 @@ cdef class Image(object):
         if ret != 0:
             raise make_ex(ret, 'error setting image %s to snapshot %d' % (self.name, snap_id))
 
+    @requires_not_closed
     def read(self, offset, length, fadvise_flags=0):
         """
         Read data from the image. Raises :class:`InvalidArgument` if
@@ -3613,6 +3807,7 @@ cdef class Image(object):
             # itself and set ret_s to NULL, hence XDECREF).
             ref.Py_XDECREF(ret_s)
 
+    @requires_not_closed
     def diff_iterate(self, offset, length, from_snapshot, iterate_cb,
                      include_parent = True, whole_object = False):
         """
@@ -3671,6 +3866,7 @@ cdef class Image(object):
             msg = 'error generating diff from snapshot %s' % from_snapshot
             raise make_ex(ret, msg)
 
+    @requires_not_closed
     def write(self, data, offset, fadvise_flags=0):
         """
         Write data to the image. Raises :class:`InvalidArgument` if
@@ -3706,6 +3902,7 @@ cdef class Image(object):
 returned %d, but %d was the maximum number of bytes it could have \
 written." % (self.name, ret, length))
 
+    @requires_not_closed
     def discard(self, offset, length):
         """
         Trim the range from the image. It will be logically filled
@@ -3718,6 +3915,7 @@ written." % (self.name, ret, length))
             msg = 'error discarding region %d~%d' % (offset, length)
             raise make_ex(ret, msg)
 
+    @requires_not_closed
     def flush(self):
         """
         Block until all writes are fully flushed if caching is enabled.
@@ -3727,6 +3925,7 @@ written." % (self.name, ret, length))
         if ret < 0:
             raise make_ex(ret, 'error flushing image')
 
+    @requires_not_closed
     def invalidate_cache(self):
         """
         Drop any cached data for the image.
@@ -3736,6 +3935,7 @@ written." % (self.name, ret, length))
         if ret < 0:
             raise make_ex(ret, 'error invalidating cache')
 
+    @requires_not_closed
     def stripe_unit(self):
         """
         Return the stripe unit used for the image.
@@ -3747,6 +3947,7 @@ written." % (self.name, ret, length))
             raise make_ex(ret, 'error getting stripe unit for image %s' % (self.name))
         return stripe_unit
 
+    @requires_not_closed
     def stripe_count(self):
         """
         Return the stripe count used for the image.
@@ -3758,6 +3959,7 @@ written." % (self.name, ret, length))
             raise make_ex(ret, 'error getting stripe count for image %s' % (self.name))
         return stripe_count
 
+    @requires_not_closed
     def create_timestamp(self):
         """
         Return the create timestamp for the image.
@@ -3770,6 +3972,7 @@ written." % (self.name, ret, length))
             raise make_ex(ret, 'error getting create timestamp for image: %s' % (self.name))
         return datetime.utcfromtimestamp(timestamp.tv_sec)
 
+    @requires_not_closed
     def access_timestamp(self):
         """
         Return the access timestamp for the image.
@@ -3782,6 +3985,7 @@ written." % (self.name, ret, length))
             raise make_ex(ret, 'error getting access timestamp for image: %s' % (self.name))
         return datetime.fromtimestamp(timestamp.tv_sec)
 
+    @requires_not_closed
     def modify_timestamp(self):
         """
         Return the modify timestamp for the image.
@@ -3794,6 +3998,7 @@ written." % (self.name, ret, length))
             raise make_ex(ret, 'error getting modify timestamp for image: %s' % (self.name))
         return datetime.fromtimestamp(timestamp.tv_sec)
 
+    @requires_not_closed
     def flatten(self, on_progress=None):
         """
         Flatten clone image (copy all blocks from parent to child)
@@ -3811,6 +4016,7 @@ written." % (self.name, ret, length))
         if ret < 0:
             raise make_ex(ret, "error flattening %s" % self.name)
 
+    @requires_not_closed
     def sparsify(self, sparse_size):
         """
         Reclaim space for zeroed image extents
@@ -3822,6 +4028,7 @@ written." % (self.name, ret, length))
         if ret < 0:
             raise make_ex(ret, "error sparsifying %s" % self.name)
 
+    @requires_not_closed
     def rebuild_object_map(self):
         """
         Rebuild the object map for the image HEAD or currently set snapshot
@@ -3832,6 +4039,7 @@ written." % (self.name, ret, length))
         if ret < 0:
             raise make_ex(ret, "error rebuilding object map %s" % self.name)
 
+    @requires_not_closed
     def list_children(self):
         """
         List children of the currently set snapshot (set via set_snap()).
@@ -3861,6 +4069,7 @@ written." % (self.name, ret, length))
                 rbd_linked_image_spec_list_cleanup(children, num_children)
                 free(children)
 
+    @requires_not_closed
     def list_children2(self):
         """
         Iterate over the children of the image or its snapshot.
@@ -3869,6 +4078,7 @@ written." % (self.name, ret, length))
         """
         return ChildIterator(self)
 
+    @requires_not_closed
     def list_descendants(self):
         """
         Iterate over the descendants of the image.
@@ -3877,6 +4087,7 @@ written." % (self.name, ret, length))
         """
         return ChildIterator(self, True)
 
+    @requires_not_closed
     def list_lockers(self):
         """
         List clients that have locked the image and information
@@ -3932,6 +4143,7 @@ written." % (self.name, ret, length))
             free(c_addrs)
             free(c_tag)
 
+    @requires_not_closed
     def lock_acquire(self, lock_mode):
         """
         Acquire a managed lock on the image.
@@ -3947,6 +4159,7 @@ written." % (self.name, ret, length))
         if ret < 0:
             raise make_ex(ret, 'error acquiring lock on image')
 
+    @requires_not_closed
     def lock_release(self):
         """
         Release a managed lock on the image that was previously acquired.
@@ -3956,6 +4169,7 @@ written." % (self.name, ret, length))
         if ret < 0:
             raise make_ex(ret, 'error releasing lock on image')
 
+    @requires_not_closed
     def lock_get_owners(self):
         """
         Iterate over the lock owners of an image.
@@ -3964,6 +4178,7 @@ written." % (self.name, ret, length))
         """
         return LockOwnerIterator(self)
 
+    @requires_not_closed
     def lock_break(self, lock_mode, lock_owner):
         """
         Break the image lock held by a another client.
@@ -3980,6 +4195,7 @@ written." % (self.name, ret, length))
         if ret < 0:
             raise make_ex(ret, 'error breaking lock on image')
 
+    @requires_not_closed
     def lock_exclusive(self, cookie):
         """
         Take an exclusive lock on the image.
@@ -3994,6 +4210,7 @@ written." % (self.name, ret, length))
         if ret < 0:
             raise make_ex(ret, 'error acquiring exclusive lock on image')
 
+    @requires_not_closed
     def lock_shared(self, cookie, tag):
         """
         Take a shared lock on the image. The tag must match
@@ -4012,6 +4229,7 @@ written." % (self.name, ret, length))
         if ret < 0:
             raise make_ex(ret, 'error acquiring shared lock on image')
 
+    @requires_not_closed
     def unlock(self, cookie):
         """
         Release a lock on the image that was locked by this rados client.
@@ -4023,6 +4241,7 @@ written." % (self.name, ret, length))
         if ret < 0:
             raise make_ex(ret, 'error unlocking image')
 
+    @requires_not_closed
     def break_lock(self, client, cookie):
         """
         Release a lock held by another rados client.
@@ -4037,6 +4256,7 @@ written." % (self.name, ret, length))
         if ret < 0:
             raise make_ex(ret, 'error unlocking image')
 
+    @requires_not_closed
     def mirror_image_enable(self):
         """
         Enable mirroring for the image.
@@ -4046,6 +4266,7 @@ written." % (self.name, ret, length))
         if ret < 0:
             raise make_ex(ret, 'error enabling mirroring for image %s' % self.name)
 
+    @requires_not_closed
     def mirror_image_disable(self, force):
         """
         Disable mirroring for the image.
@@ -4059,6 +4280,7 @@ written." % (self.name, ret, length))
         if ret < 0:
             raise make_ex(ret, 'error disabling mirroring for image %s' % self.name)
 
+    @requires_not_closed
     def mirror_image_promote(self, force):
         """
         Promote the image to primary for mirroring.
@@ -4072,6 +4294,7 @@ written." % (self.name, ret, length))
         if ret < 0:
             raise make_ex(ret, 'error promoting image %s to primary' % self.name)
 
+    @requires_not_closed
     def mirror_image_demote(self):
         """
         Demote the image to secondary for mirroring.
@@ -4081,6 +4304,7 @@ written." % (self.name, ret, length))
         if ret < 0:
             raise make_ex(ret, 'error demoting image %s to secondary' % self.name)
 
+    @requires_not_closed
     def mirror_image_resync(self):
         """
         Flag the image to resync.
@@ -4090,6 +4314,7 @@ written." % (self.name, ret, length))
         if ret < 0:
             raise make_ex(ret, 'error to resync image %s' % self.name)
 
+    @requires_not_closed
     def mirror_image_get_info(self):
         """
         Get mirror info for the image.
@@ -4115,6 +4340,7 @@ written." % (self.name, ret, length))
         free(c_info.global_id)
         return info
 
+    @requires_not_closed
     def mirror_image_get_status(self):
         """
         Get mirror status for the image.
@@ -4159,6 +4385,7 @@ written." % (self.name, ret, length))
         free(c_status.description)
         return status
 
+    @requires_not_closed
     def mirror_image_get_instance_id(self):
         """
         Get mirror instance id for the image.
@@ -4183,6 +4410,7 @@ written." % (self.name, ret, length))
         finally:
             free(instance_id)
 
+    @requires_not_closed
     def aio_read(self, offset, length, oncomplete, fadvise_flags=0):
         """
         Asynchronously read data from the image
@@ -4206,7 +4434,6 @@ written." % (self.name, ret, length))
         :returns: :class:`Completion` - the completion object
         :raises: :class:`InvalidArgument`, :class:`IOError`
         """
-
         cdef:
             char *ret_buf
             uint64_t _offset = offset
@@ -4238,6 +4465,7 @@ written." % (self.name, ret, length))
 
         return completion
 
+    @requires_not_closed
     def aio_write(self, data, offset, oncomplete, fadvise_flags=0):
         """
         Asynchronously write data to the image
@@ -4260,7 +4488,6 @@ written." % (self.name, ret, length))
         :returns: :class:`Completion` - the completion object
         :raises: :class:`InvalidArgument`, :class:`IOError`
         """
-
         cdef:
             uint64_t _offset = offset
             char *_data = data
@@ -4283,12 +4510,12 @@ written." % (self.name, ret, length))
 
         return completion
 
+    @requires_not_closed
     def aio_discard(self, offset, length, oncomplete):
         """
         Asynchronously trim the range from the image. It will be logically
         filled with zeroes.
         """
-
         cdef:
             uint64_t _offset = offset
             size_t _length = length
@@ -4309,12 +4536,12 @@ written." % (self.name, ret, length))
 
         return completion
 
+    @requires_not_closed
     def aio_flush(self, oncomplete):
         """
         Asynchronously wait until all writes are fully flushed if caching is
         enabled.
         """
-
         cdef Completion completion = self.__get_completion(oncomplete)
         try:
             completion.__persist()
@@ -4328,6 +4555,7 @@ written." % (self.name, ret, length))
 
         return completion
 
+    @requires_not_closed
     def metadata_get(self, key):
         """
         Get image metadata for the given key.
@@ -4358,6 +4586,7 @@ written." % (self.name, ret, length))
         finally:
             free(value)
 
+    @requires_not_closed
     def metadata_set(self, key, value):
         """
         Set image metadata for the given key.
@@ -4379,7 +4608,7 @@ written." % (self.name, ret, length))
             raise make_ex(ret, 'error setting metadata %s for image %s' %
                           (key, self.name))
 
-
+    @requires_not_closed
     def metadata_remove(self, key):
         """
         Remove image metadata for the given key.
@@ -4399,6 +4628,7 @@ written." % (self.name, ret, length))
             raise make_ex(ret, 'error removing metadata %s for image %s' %
                           (key, self.name))
 
+    @requires_not_closed
     def metadata_list(self):
         """
         List image metadata.
@@ -4407,6 +4637,7 @@ written." % (self.name, ret, length))
         """
         return MetadataIterator(self)
 
+    @requires_not_closed
     def watchers_list(self):
         """
         List image watchers.
@@ -4415,6 +4646,7 @@ written." % (self.name, ret, length))
         """
         return WatcherIterator(self)
 
+    @requires_not_closed
     def config_list(self):
         """
         List image-level config overrides.
@@ -4423,6 +4655,7 @@ written." % (self.name, ret, length))
         """
         return ConfigImageIterator(self)
 
+    @requires_not_closed
     def snap_get_namespace_type(self, snap_id):
         """
         Get the snapshot namespace type.
@@ -4439,6 +4672,7 @@ written." % (self.name, ret, length))
 
         return namespace_type
 
+    @requires_not_closed
     def snap_get_group_namespace(self, snap_id):
         """
         get the group namespace details.
@@ -4471,6 +4705,7 @@ written." % (self.name, ret, length))
                                          sizeof(rbd_snap_group_namespace_t))
         return info
 
+    @requires_not_closed
     def snap_get_trash_namespace(self, snap_id):
         """
         get the trash namespace details.
@@ -4567,6 +4802,8 @@ cdef class LockOwnerIterator(object):
         object image
 
     def __init__(self, Image image):
+        image.require_not_closed()
+
         self.image = image
         self.lock_owners = NULL
         self.num_lock_owners = 8
@@ -4579,6 +4816,9 @@ cdef class LockOwnerIterator(object):
                                           self.lock_owners,
                                           &self.num_lock_owners)
             if ret >= 0:
+                break
+            elif ret == -errno.ENOENT:
+                self.num_lock_owners = 0
                 break
             elif ret != -errno.ERANGE:
                 raise make_ex(ret, 'error listing lock owners for image %s' % image.name)
@@ -4606,15 +4846,17 @@ cdef class MetadataIterator(object):
     """
 
     cdef:
-        object image_name
-        rbd_image_t image
+        cdef object image
+        rbd_image_t c_image
         char *last_read
         uint64_t max_read
         object next_chunk
 
     def __init__(self, Image image):
-        self.image_name = image.name
-        self.image = image.image
+        image.require_not_closed()
+
+        self.image = image
+        self.c_image = image.image
         self.last_read = strdup("")
         self.max_read = 32
         self.get_next_chunk()
@@ -4632,6 +4874,8 @@ cdef class MetadataIterator(object):
             free(self.last_read)
 
     def get_next_chunk(self):
+        self.image.require_not_closed()
+
         cdef:
             char *c_keys = NULL
             size_t keys_size = 4096
@@ -4642,14 +4886,14 @@ cdef class MetadataIterator(object):
                 c_keys = <char *>realloc_chk(c_keys, keys_size)
                 c_vals = <char *>realloc_chk(c_vals, vals_size)
                 with nogil:
-                    ret = rbd_metadata_list(self.image, self.last_read,
+                    ret = rbd_metadata_list(self.c_image, self.last_read,
                                             self.max_read, c_keys, &keys_size,
                                             c_vals, &vals_size)
                 if ret >= 0:
                     break
                 elif ret != -errno.ERANGE:
                     raise make_ex(ret, 'error listing metadata for image %s' %
-                                  self.image_name)
+                                  self.image.name)
             keys = [decode_cstr(key) for key in
                         c_keys[:keys_size].split(b'\0') if key]
             vals = [decode_cstr(val) for val in
@@ -4689,6 +4933,8 @@ cdef class SnapIterator(object):
     cdef object image
 
     def __init__(self, Image image):
+        image.require_not_closed()
+
         self.image = image
         self.snaps = NULL
         self.num_snaps = 10
@@ -4813,6 +5059,8 @@ cdef class ChildIterator(object):
     cdef object image
 
     def __init__(self, Image image, descendants=False):
+        image.require_not_closed()
+
         self.image = image
         self.children = NULL
         self.num_children = 10
@@ -4867,6 +5115,8 @@ cdef class WatcherIterator(object):
     cdef object image
 
     def __init__(self, Image image):
+        image.require_not_closed()
+
         self.image = image
         self.watchers = NULL
         self.num_watchers = 10
@@ -4914,6 +5164,8 @@ cdef class ConfigImageIterator(object):
         int num_options
 
     def __init__(self, Image image):
+        image.require_not_closed()
+
         self.options = NULL
         self.num_options = 32
         while True:

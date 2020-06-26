@@ -201,6 +201,9 @@ OPTION(mon_compact_on_bootstrap, OPT_BOOL)  // trigger leveldb compaction on boo
 OPTION(mon_compact_on_trim, OPT_BOOL)       // compact (a prefix) when we trim old states
 OPTION(mon_osd_cache_size, OPT_INT)  // the size of osdmaps cache, not to rely on underlying store's cache
 
+OPTION(mon_osd_cache_size_min, OPT_U64) // minimum amount of memory to cache osdmaps
+OPTION(mon_memory_target, OPT_U64) // amount of mapped memory for osdmaps
+OPTION(mon_memory_autotune, OPT_BOOL) // autotune cache memory for osdmap
 OPTION(mon_cpu_threads, OPT_INT)
 OPTION(mon_osd_mapping_pgs_per_chunk, OPT_INT)
 OPTION(mon_clean_pg_upmaps_per_chunk, OPT_INT)
@@ -280,7 +283,8 @@ OPTION(mon_scrub_inject_crc_mismatch, OPT_DOUBLE) // probability of injected crc
 OPTION(mon_scrub_inject_missing_keys, OPT_DOUBLE) // probability of injected missing keys [0.0, 1.0]
 OPTION(mon_config_key_max_entry_size, OPT_INT) // max num bytes per config-key entry
 OPTION(mon_sync_timeout, OPT_DOUBLE)
-OPTION(mon_sync_max_payload_size, OPT_U32) // max size for a sync chunk payload (say)
+OPTION(mon_sync_max_payload_size, OPT_SIZE)
+OPTION(mon_sync_max_payload_keys, OPT_INT)
 OPTION(mon_sync_debug, OPT_BOOL) // enable sync-specific debug
 OPTION(mon_inject_sync_get_chunk_delay, OPT_DOUBLE)  // inject N second delay on each get_chunk request
 OPTION(mon_osd_force_trim_to, OPT_INT)   // force mon to trim maps to this point, regardless of min_last_epoch_clean (dangerous)
@@ -343,6 +347,7 @@ OPTION(mon_client_ping_timeout, OPT_DOUBLE)   // fail if we don't hear back
 OPTION(mon_client_hunt_interval_backoff, OPT_DOUBLE) // each time we reconnect to a monitor, double our timeout
 OPTION(mon_client_hunt_interval_max_multiple, OPT_DOUBLE) // up to a max of 10*default (30 seconds)
 OPTION(mon_client_max_log_entries_per_message, OPT_INT)
+OPTION(mon_client_directed_command_retry, OPT_INT)
 OPTION(client_cache_size, OPT_INT)
 OPTION(client_cache_mid, OPT_FLOAT)
 OPTION(client_use_random_mds, OPT_BOOL)
@@ -714,6 +719,7 @@ OPTION(osd_max_push_cost, OPT_U64)  // max size of push message
 OPTION(osd_max_push_objects, OPT_U64)  // max objects in single push op
 OPTION(osd_max_scrubs, OPT_INT)
 OPTION(osd_scrub_during_recovery, OPT_BOOL) // Allow new scrubs to start while recovery is active on the OSD
+OPTION(osd_repair_during_recovery, OPT_BOOL) // Allow new requested repairs to start while recovery is active on the OSD
 OPTION(osd_scrub_begin_hour, OPT_INT)
 OPTION(osd_scrub_end_hour, OPT_INT)
 OPTION(osd_scrub_begin_week_day, OPT_INT)
@@ -781,6 +787,7 @@ OPTION(osd_debug_random_push_read_error, OPT_DOUBLE)
 OPTION(osd_debug_verify_cached_snaps, OPT_BOOL)
 OPTION(osd_debug_deep_scrub_sleep, OPT_FLOAT)
 OPTION(osd_debug_no_acting_change, OPT_BOOL)
+OPTION(osd_debug_pretend_recovery_active, OPT_BOOL)
 OPTION(osd_enable_op_tracker, OPT_BOOL) // enable/disable OSD op tracking
 OPTION(osd_num_op_tracker_shard, OPT_U32) // The number of shards for holding the ops
 OPTION(osd_op_history_size, OPT_U32)    // Max number of completed ops to track
@@ -789,6 +796,7 @@ OPTION(osd_op_history_slow_op_size, OPT_U32)           // Max number of slow ops
 OPTION(osd_op_history_slow_op_threshold, OPT_DOUBLE) // track the op if over this threshold
 OPTION(osd_target_transaction_size, OPT_INT)     // to adjust various transactions that batch smaller items
 OPTION(osd_failsafe_full_ratio, OPT_FLOAT) // what % full makes an OSD "full" (failsafe)
+OPTION(osd_fast_shutdown, OPT_BOOL)
 OPTION(osd_fast_fail_on_connection_refused, OPT_BOOL) // immediately mark OSDs as down once they refuse to accept connections
 
 OPTION(osd_pg_object_context_cache_count, OPT_INT)
@@ -931,6 +939,7 @@ OPTION(bdev_async_discard, OPT_BOOL)
 OPTION(objectstore_blackhole, OPT_BOOL)
 
 OPTION(bluefs_alloc_size, OPT_U64)
+OPTION(bluefs_shared_alloc_size, OPT_U64)
 OPTION(bluefs_max_prefetch, OPT_U64)
 OPTION(bluefs_min_log_runway, OPT_U64)  // alloc when we get this low
 OPTION(bluefs_max_log_runway, OPT_U64)  // alloc this much at a time
@@ -1038,12 +1047,14 @@ OPTION(bluestore_max_deferred_txc, OPT_U64)
 OPTION(bluestore_rocksdb_options, OPT_STR)
 OPTION(bluestore_fsck_on_mount, OPT_BOOL)
 OPTION(bluestore_fsck_on_mount_deep, OPT_BOOL)
+OPTION(bluestore_fsck_quick_fix_on_mount, OPT_BOOL)
 OPTION(bluestore_fsck_on_umount, OPT_BOOL)
 OPTION(bluestore_fsck_on_umount_deep, OPT_BOOL)
 OPTION(bluestore_fsck_on_mkfs, OPT_BOOL)
 OPTION(bluestore_fsck_on_mkfs_deep, OPT_BOOL)
 OPTION(bluestore_sync_submit_transaction, OPT_BOOL) // submit kv txn in queueing thread (not kv_sync_thread)
 OPTION(bluestore_fsck_read_bytes_cap, OPT_U64)
+OPTION(bluestore_fsck_quick_fix_threads, OPT_INT)
 OPTION(bluestore_throttle_bytes, OPT_U64)
 OPTION(bluestore_throttle_deferred_bytes, OPT_U64)
 OPTION(bluestore_throttle_cost_per_io_hdd, OPT_U64)
@@ -1072,12 +1083,15 @@ OPTION(bluestore_debug_permit_any_bdev_label, OPT_BOOL)
 OPTION(bluestore_debug_random_read_err, OPT_DOUBLE)
 OPTION(bluestore_debug_inject_bug21040, OPT_BOOL)
 OPTION(bluestore_debug_inject_csum_err_probability, OPT_FLOAT)
-OPTION(bluestore_no_per_pool_stats_tolerance, OPT_STR)
+OPTION(bluestore_fsck_error_on_no_per_pool_stats, OPT_BOOL)
 OPTION(bluestore_warn_on_bluefs_spillover, OPT_BOOL)
 OPTION(bluestore_warn_on_legacy_statfs, OPT_BOOL)
 OPTION(bluestore_log_op_age, OPT_DOUBLE)
 OPTION(bluestore_log_omap_iterator_age, OPT_DOUBLE)
 OPTION(bluestore_log_collection_list_age, OPT_DOUBLE)
+OPTION(bluestore_volume_selection_policy, OPT_STR)
+OPTION(bluestore_volume_selection_reserved_factor, OPT_DOUBLE)
+OPTION(bluestore_volume_selection_reserved, OPT_INT)
 
 OPTION(kstore_max_ops, OPT_U64)
 OPTION(kstore_max_bytes, OPT_U64)
@@ -1262,6 +1276,10 @@ OPTION(rados_tracing, OPT_BOOL) // true if LTTng-UST tracepoints should be enabl
 OPTION(nss_db_path, OPT_STR) // path to nss db
 
 
+OPTION(rgw_max_attr_name_len, OPT_SIZE)
+OPTION(rgw_max_attr_size, OPT_SIZE)
+OPTION(rgw_max_attrs_num_in_req, OPT_U64)
+
 OPTION(rgw_max_chunk_size, OPT_INT)
 OPTION(rgw_put_obj_min_window_size, OPT_INT)
 OPTION(rgw_put_obj_max_window_size, OPT_INT)
@@ -1338,7 +1356,6 @@ OPTION(rgw_keystone_accepted_admin_roles, OPT_STR) // list of roles allowing an 
 OPTION(rgw_keystone_token_cache_size, OPT_INT)  // max number of entries in keystone token cache
 OPTION(rgw_keystone_revocation_interval, OPT_INT)  // seconds between tokens revocation check
 OPTION(rgw_keystone_verify_ssl, OPT_BOOL) // should we try to verify keystone's ssl
-OPTION(rgw_keystone_implicit_tenants, OPT_BOOL)  // create new users in their own tenants of the same name
 OPTION(rgw_cross_domain_policy, OPT_STR)
 OPTION(rgw_healthcheck_disabling_path, OPT_STR) // path that existence causes the healthcheck to respond 503
 OPTION(rgw_s3_auth_use_rados, OPT_BOOL)  // should we try to use the internal credentials for s3?
@@ -1397,6 +1414,10 @@ OPTION(rgw_nfs_max_gc, OPT_INT) /* max gc events per cycle */
 OPTION(rgw_nfs_write_completion_interval_s, OPT_INT) /* stateless (V3)
 							  * commit
 							  * delay */
+OPTION(rgw_nfs_s3_fast_attrs, OPT_BOOL) /* use fast S3 attrs from
+					 * bucket index--currently
+					 * assumes NFS mounts are
+					 * immutable */
 
 OPTION(rgw_zone, OPT_STR) // zone name
 OPTION(rgw_zone_root_pool, OPT_STR)    // pool where zone specific info is stored

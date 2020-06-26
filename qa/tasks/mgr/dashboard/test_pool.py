@@ -195,18 +195,18 @@ class PoolTest(DashboardTestCase):
             ['osd', 'erasure-code-profile', 'set', 'ecprofile', 'crush-failure-domain=osd'])
         pools = [{
             'pool': 'dashboard_pool1',
-            'pg_num': '10',
+            'pg_num': '32',
             'pool_type': 'replicated',
             'application_metadata': ['rbd', 'sth'],
         }, {
             'pool': 'dashboard_pool2',
-            'pg_num': '10',
+            'pg_num': '32',
             'pool_type': 'erasure',
             'erasure_code_profile': 'ecprofile',
             'crush_rule': 'ecrule',
         }, {
             'pool': 'dashboard_pool3',
-            'pg_num': '10',
+            'pg_num': '32',
             'pool_type': 'replicated',
             'compression_algorithm': 'zstd',
             'compression_mode': 'aggressive',
@@ -219,7 +219,7 @@ class PoolTest(DashboardTestCase):
     def test_update(self):
         pool = {
             'pool': 'dashboard_pool_update1',
-            'pg_num': '4',
+            'pg_num': '32',
             'pool_type': 'replicated',
             'compression_mode': 'passive',
             'compression_algorithm': 'snappy',
@@ -235,7 +235,10 @@ class PoolTest(DashboardTestCase):
             # they can't recover from the resulting warning state.
             # Feel free to test it locally.
             # {
-            #     'pg_num': '8',
+            #     'pg_num': '2', # Decrease PGs
+            # },
+            # {
+            #     'pg_num': '8', # Increase PGs
             # },
             {
                 'application_metadata': ['rgw'],
@@ -285,8 +288,10 @@ class PoolTest(DashboardTestCase):
             'compression_algorithms': JList(six.string_types),
             'compression_modes': JList(six.string_types),
             'is_all_bluestore': bool,
-            "bluestore_compression_algorithm": six.string_types,
+            'bluestore_compression_algorithm': six.string_types,
             'osd_count': int,
             'crush_rules_replicated': JList(JObj({}, allow_unknown=True)),
             'crush_rules_erasure': JList(JObj({}, allow_unknown=True)),
+            'pg_autoscale_default_mode': six.string_types,
+            'pg_autoscale_modes': JList(six.string_types),
         }))

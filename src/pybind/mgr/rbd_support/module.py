@@ -82,6 +82,21 @@ TASK_RETRY_INTERVAL = timedelta(seconds=30)
 MAX_COMPLETED_TASKS = 50
 
 
+class NotAuthorizedError(Exception):
+    pass
+
+
+def is_authorized(module, pool, namespace):
+    return module.is_authorized({"pool": pool or '',
+                                 "namespace": namespace or ''})
+
+
+def authorize_request(module, pool, namespace):
+    if not is_authorized(module, pool, namespace):
+        raise NotAuthorizedError("not authorized on pool={}, namespace={}".format(
+            pool, namespace))
+
+
 def extract_pool_key(pool_spec):
     if not pool_spec:
         return GLOBAL_POOL_KEY
@@ -302,7 +317,8 @@ class PerfHandler:
     def resolve_pool_id(self, pool_name):
         pool_id = self.module.rados.pool_lookup(pool_name)
         if not pool_id:
-            raise rados.ObjectNotFound("Pool '{}' not found".format(pool_name))
+            raise rados.ObjectNotFound("Pool '{}' not found".format(pool_name),
+                                       errno.ENOENT)
         return pool_id
 
     def scrub_expired_queries(self):
@@ -479,6 +495,8 @@ class PerfHandler:
         self.scrub_expired_queries()
 
         pool_key = extract_pool_key(pool_spec)
+        authorize_request(self.module, pool_key[0], pool_key[1])
+
         user_query = self.register_query(pool_key)
 
         now = datetime.now()
@@ -673,9 +691,16 @@ class TaskHandler:
                 with self.module.rados.open_ioctx2(int(pool_id)) as ioctx:
                     self.load_task_queue(ioctx, pool_name)
 
-                    for namespace in rbd.RBD().namespace_list(ioctx):
+                    try:
+                        namespaces = rbd.RBD().namespace_list(ioctx)
+                    except rbd.OperationNotSupported:
+                        self.log.debug("Namespaces not supported")
+                        continue
+
+                    for namespace in namespaces:
                         ioctx.set_namespace(namespace)
                         self.load_task_queue(ioctx, pool_name)
+
             except rados.ObjectNotFound:
                 # pool DNE
                 pass
@@ -978,6 +1003,8 @@ class TaskHandler:
 
     def queue_flatten(self, image_spec):
         image_spec = self.extract_image_spec(image_spec)
+
+        authorize_request(self.module, image_spec[0], image_spec[1])
         self.log.info("queue_flatten: {}".format(image_spec))
 
         refs = {TASK_REF_ACTION: TASK_REF_ACTION_FLATTEN,
@@ -1016,6 +1043,8 @@ class TaskHandler:
 
     def queue_remove(self, image_spec):
         image_spec = self.extract_image_spec(image_spec)
+
+        authorize_request(self.module, image_spec[0], image_spec[1])
         self.log.info("queue_remove: {}".format(image_spec))
 
         refs = {TASK_REF_ACTION: TASK_REF_ACTION_REMOVE,
@@ -1050,6 +1079,8 @@ class TaskHandler:
 
     def queue_trash_remove(self, image_id_spec):
         image_id_spec = self.extract_image_spec(image_id_spec)
+
+        authorize_request(self.module, image_id_spec[0], image_id_spec[1])
         self.log.info("queue_trash_remove: {}".format(image_id_spec))
 
         refs = {TASK_REF_ACTION: TASK_REF_ACTION_TRASH_REMOVE,
@@ -1075,7 +1106,7 @@ class TaskHandler:
         except (rbd.InvalidArgument, rbd.ImageNotFound):
             return None
 
-    def validate_image_migrating(self, migration_status):
+    def validate_image_migrating(self, image_spec, migration_status):
         if not migration_status:
             raise rbd.InvalidArgument("Image {} is not migrating".format(
                 self.format_image_spec(image_spec)), errno=errno.EINVAL)
@@ -1089,6 +1120,8 @@ class TaskHandler:
 
     def queue_migration_execute(self, image_spec):
         image_spec = self.extract_image_spec(image_spec)
+
+        authorize_request(self.module, image_spec[0], image_spec[1])
         self.log.info("queue_migration_execute: {}".format(image_spec))
 
         refs = {TASK_REF_ACTION: TASK_REF_ACTION_MIGRATION_EXECUTE,
@@ -1105,7 +1138,7 @@ class TaskHandler:
             if task:
                 return 0, task.to_json(), ''
 
-            self.validate_image_migrating(status)
+            self.validate_image_migrating(image_spec, status)
             if status['state'] not in [rbd.RBD_IMAGE_MIGRATION_STATE_PREPARED,
                                        rbd.RBD_IMAGE_MIGRATION_STATE_EXECUTING]:
                 raise rbd.InvalidArgument("Image {} is not in ready state".format(
@@ -1125,6 +1158,8 @@ class TaskHandler:
 
     def queue_migration_commit(self, image_spec):
         image_spec = self.extract_image_spec(image_spec)
+
+        authorize_request(self.module, image_spec[0], image_spec[1])
         self.log.info("queue_migration_commit: {}".format(image_spec))
 
         refs = {TASK_REF_ACTION: TASK_REF_ACTION_MIGRATION_COMMIT,
@@ -1141,7 +1176,7 @@ class TaskHandler:
             if task:
                 return 0, task.to_json(), ''
 
-            self.validate_image_migrating(status)
+            self.validate_image_migrating(image_spec, status)
             if status['state'] != rbd.RBD_IMAGE_MIGRATION_STATE_EXECUTED:
                 raise rbd.InvalidArgument("Image {} has not completed migration".format(
                     self.format_image_spec(image_spec)), errno=errno.EINVAL)
@@ -1153,6 +1188,8 @@ class TaskHandler:
 
     def queue_migration_abort(self, image_spec):
         image_spec = self.extract_image_spec(image_spec)
+
+        authorize_request(self.module, image_spec[0], image_spec[1])
         self.log.info("queue_migration_abort: {}".format(image_spec))
 
         refs = {TASK_REF_ACTION: TASK_REF_ACTION_MIGRATION_ABORT,
@@ -1169,7 +1206,7 @@ class TaskHandler:
             if task:
                 return 0, task.to_json(), ''
 
-            self.validate_image_migrating(status)
+            self.validate_image_migrating(image_spec, status)
             return 0, self.add_task(ioctx,
                                     "Aborting image migration for {}".format(
                                         self.format_image_spec(image_spec)),
@@ -1178,10 +1215,12 @@ class TaskHandler:
     def task_cancel(self, task_id):
         self.log.info("task_cancel: {}".format(task_id))
 
-        if task_id not in self.tasks_by_id:
+        task = self.tasks_by_id.get(task_id)
+        if not task or not is_authorized(self.module,
+                                         task.refs[TASK_REF_POOL_NAME],
+                                         task.refs[TASK_REF_POOL_NAMESPACE]):
             return -errno.ENOENT, '', "No such task {}".format(task_id)
 
-        task = self.tasks_by_id[task_id]
         task.cancel()
 
         remove_in_memory = True
@@ -1203,15 +1242,21 @@ class TaskHandler:
         self.log.info("task_list: {}".format(task_id))
 
         if task_id:
-            if task_id not in self.tasks_by_id:
+            task = self.tasks_by_id.get(task_id)
+            if not task or not is_authorized(self.module,
+                                             task.refs[TASK_REF_POOL_NAME],
+                                             task.refs[TASK_REF_POOL_NAMESPACE]):
                 return -errno.ENOENT, '', "No such task {}".format(task_id)
 
-            result = self.tasks_by_id[task_id].to_dict()
+            result = task.to_dict()
         else:
             result = []
             for sequence in sorted(self.tasks_by_sequence.keys()):
                 task = self.tasks_by_sequence[sequence]
-                result.append(task.to_dict())
+                if is_authorized(self.module,
+                                 task.refs[TASK_REF_POOL_NAME],
+                                 task.refs[TASK_REF_POOL_NAMESPACE]):
+                    result.append(task.to_dict())
 
         return 0, json.dumps(result), ""
 
@@ -1327,6 +1372,8 @@ class Module(MgrModule):
                 elif prefix.startswith('rbd task '):
                     return self.task.handle_command(inbuf, prefix[9:], cmd)
 
+            except NotAuthorizedError:
+                raise
             except Exception as ex:
                 # log the full traceback but don't send it to the CLI user
                 self.log.fatal("Fatal runtime error: {}\n{}".format(
@@ -1343,5 +1390,7 @@ class Module(MgrModule):
             return -errno.ENOENT, "", str(ex)
         except ValueError as ex:
             return -errno.EINVAL, "", str(ex)
+        except NotAuthorizedError as ex:
+            return -errno.EACCES, "", str(ex)
 
         raise NotImplementedError(cmd['prefix'])

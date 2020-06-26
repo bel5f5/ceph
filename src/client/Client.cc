@@ -97,7 +97,7 @@
 #include "include/ceph_assert.h"
 #include "include/stat.h"
 
-#include "include/cephfs/ceph_statx.h"
+#include "include/cephfs/ceph_ll_client.h"
 
 #if HAVE_GETGROUPLIST
 #include <grp.h>
@@ -270,6 +270,7 @@ Client::Client(Messenger *m, MonClient *mc, Objecter *objecter_)
     async_dentry_invalidator(m->cct),
     interrupt_finisher(m->cct),
     remount_finisher(m->cct),
+    async_ino_releasor(m->cct),
     objecter_finisher(m->cct),
     m_command_hook(this),
     fscid(0)
@@ -278,6 +279,8 @@ Client::Client(Messenger *m, MonClient *mc, Objecter *objecter_)
 
   user_id = cct->_conf->client_mount_uid;
   group_id = cct->_conf->client_mount_gid;
+  fuse_default_permissions = cct->_conf.get_val<bool>(
+    "fuse_default_permissions");
 
   if (cct->_conf->client_acl_type == "posix_acl")
     acl_type = POSIX_ACL;
@@ -301,9 +304,6 @@ Client::Client(Messenger *m, MonClient *mc, Objecter *objecter_)
 				  cct->_conf->client_oc_target_dirty,
 				  cct->_conf->client_oc_max_dirty_age,
 				  true));
-  objecter_finisher.start();
-  filer.reset(new Filer(objecter, &objecter_finisher));
-  objecter->enable_blacklist_events();
 }
 
 
@@ -472,10 +472,20 @@ void Client::dump_status(Formatter *f)
   }
 }
 
-int Client::init()
+void Client::_pre_init()
 {
   timer.init();
+
+  objecter_finisher.start();
+  filer.reset(new Filer(objecter, &objecter_finisher));
+  objecter->enable_blacklist_events();
+
   objectcacher->start();
+}
+
+int Client::init()
+{
+  _pre_init();
 
   client_lock.Lock();
   ceph_assert(!initialized);
@@ -587,6 +597,12 @@ void Client::shutdown()
     ldout(cct, 10) << "shutdown stopping remount finisher" << dendl;
     remount_finisher.wait_for_empty();
     remount_finisher.stop();
+  }
+
+  if (ino_release_cb) {
+    ldout(cct, 10) << "shutdown stopping inode release finisher" << dendl;
+    async_ino_releasor.wait_for_empty();
+    async_ino_releasor.stop();
   }
 
   objectcacher->stop();  // outside of client_lock! this does a join.
@@ -1047,20 +1063,6 @@ void Client::update_dir_dist(Inode *in, DirStat *dst)
 
   // replicated
   in->dir_replicated = !dst->dist.empty();  // FIXME that's just one frag!
-  
-  // dist
-  /*
-  if (!st->dirfrag_dist.empty()) {   // FIXME
-    set<int> dist = st->dirfrag_dist.begin()->second;
-    if (dist.empty() && !in->dir_contacts.empty())
-      ldout(cct, 9) << "lost dist spec for " << in->ino 
-              << " " << dist << dendl;
-    if (!dist.empty() && in->dir_contacts.empty()) 
-      ldout(cct, 9) << "got dist spec for " << in->ino 
-              << " " << dist << dendl;
-    in->dir_contacts = dist;
-  }
-  */
 }
 
 void Client::clear_dir_complete_and_ordered(Inode *diri, bool complete)
@@ -1851,7 +1853,7 @@ int Client::encode_inode_release(Inode *in, MetaRequest *req,
 {
   ldout(cct, 20) << __func__ << " enter(in:" << *in << ", req:" << req
 	   << " mds:" << mds << ", drop:" << drop << ", unless:" << unless
-	   << ", have:" << ", force:" << force << ")" << dendl;
+	   << ", force:" << force << ")" << dendl;
   int released = 0;
   auto it = in->caps.find(mds);
   if (it != in->caps.end()) {
@@ -1859,15 +1861,20 @@ int Client::encode_inode_release(Inode *in, MetaRequest *req,
     drop &= ~(in->dirty_caps | get_caps_used(in));
     if ((drop & cap.issued) &&
 	!(unless & cap.issued)) {
-      ldout(cct, 25) << "Dropping caps. Initial " << ccap_string(cap.issued) << dendl;
+      ldout(cct, 25) << "dropping caps " << ccap_string(drop) << dendl;
       cap.issued &= ~drop;
       cap.implemented &= ~drop;
       released = 1;
-      ldout(cct, 25) << "Now have: " << ccap_string(cap.issued) << dendl;
     } else {
       released = force;
     }
     if (released) {
+      cap.wanted = in->caps_wanted();
+      if (&cap == in->auth_cap &&
+	  !(cap.wanted & CEPH_CAP_ANY_FILE_WR)) {
+	in->requested_max_size = 0;
+	ldout(cct, 25) << "reset requested_max_size due to not wanting any file write cap" << dendl;
+      }
       ceph_mds_request_release rel;
       rel.ino = in->ino;
       rel.cap_id = cap.cap_id;
@@ -2942,8 +2949,21 @@ void Client::kick_requests_closed(MetaSession *session)
       if (req->got_unsafe) {
 	lderr(cct) << __func__ << " removing unsafe request " << req->get_tid() << dendl;
 	req->unsafe_item.remove_myself();
-	req->unsafe_dir_item.remove_myself();
-	req->unsafe_target_item.remove_myself();
+	if (is_dir_operation(req)) {
+	  Inode *dir = req->inode();
+	  assert(dir);
+	  dir->set_async_err(-EIO);
+	  lderr(cct) << "kick_requests_closed drop req of inode(dir) : "
+		     <<  dir->ino  << " " << req->get_tid() << dendl;
+	  req->unsafe_dir_item.remove_myself();
+	}
+	if (req->target) {
+	  InodeRef &in = req->target;
+	  in->set_async_err(-EIO);
+	  lderr(cct) << "kick_requests_closed drop req of inode : "
+		     <<  in->ino  << " " << req->get_tid() << dendl;
+	  req->unsafe_target_item.remove_myself();
+	}
 	signal_cond_list(req->waitfor_safe);
 	unregister_request(req);
       }
@@ -3220,13 +3240,16 @@ int Client::get_caps(Inode *in, int need, int want, int *phave, loff_t endoff)
     bool waitfor_commit = false;
 
     if (have & need & CEPH_CAP_FILE_WR) {
-      if (endoff > 0 &&
-	  (endoff >= (loff_t)in->max_size ||
-	   endoff > (loff_t)(in->size << 1)) &&
-	  endoff > (loff_t)in->wanted_max_size) {
-	ldout(cct, 10) << "wanted_max_size " << in->wanted_max_size << " -> " << endoff << dendl;
-	in->wanted_max_size = endoff;
-	check_caps(in, 0);
+      if (endoff > 0) {
+	 if ((endoff >= (loff_t)in->max_size ||
+	      endoff > (loff_t)(in->size << 1)) &&
+	     endoff > (loff_t)in->wanted_max_size) {
+	   ldout(cct, 10) << "wanted_max_size " << in->wanted_max_size << " -> " << endoff << dendl;
+	   in->wanted_max_size = endoff;
+	 }
+	 if (in->wanted_max_size > in->max_size &&
+	     in->wanted_max_size > in->requested_max_size)
+	   check_caps(in, 0);
       }
 
       if (endoff >= 0 && endoff > (loff_t)in->max_size) {
@@ -3309,7 +3332,7 @@ void Client::cap_delay_requeue(Inode *in)
 }
 
 void Client::send_cap(Inode *in, MetaSession *session, Cap *cap,
-		      bool sync, int used, int want, int retain,
+		      int flags, int used, int want, int retain,
 		      int flush, ceph_tid_t flush_tid)
 {
   int held = cap->issued | cap->implemented;
@@ -3320,7 +3343,6 @@ void Client::send_cap(Inode *in, MetaSession *session, Cap *cap,
 
   ldout(cct, 10) << __func__ << " " << *in
 	   << " mds." << session->mds_num << " seq " << cap->seq
-	   << (sync ? " sync " : " async ")
 	   << " used " << ccap_string(used)
 	   << " want " << ccap_string(want)
 	   << " flush " << ccap_string(flush)
@@ -3395,11 +3417,13 @@ void Client::send_cap(Inode *in, MetaSession *session, Cap *cap,
   m->btime = in->btime;
   m->time_warp_seq = in->time_warp_seq;
   m->change_attr = in->change_attr;
-  if (sync)
-    m->flags |= MClientCaps::FLAG_SYNC;
-  if (!in->cap_snaps.empty())
-    m->flags |= MClientCaps::FLAG_PENDING_CAPSNAP;
-    
+
+  if (!(flags & MClientCaps::FLAG_PENDING_CAPSNAP) &&
+      !in->cap_snaps.empty() &&
+      in->cap_snaps.rbegin()->second.flush_tid == 0)
+    flags |= MClientCaps::FLAG_PENDING_CAPSNAP;
+  m->flags = flags;
+
   if (flush & CEPH_CAP_FILE_WR) {
     m->inline_version = in->inline_version;
     m->inline_data = in->inline_data;
@@ -3409,9 +3433,14 @@ void Client::send_cap(Inode *in, MetaSession *session, Cap *cap,
   m->set_snap_follows(follows);
   cap->wanted = want;
   if (cap == in->auth_cap) {
-    m->set_max_size(in->wanted_max_size);
-    in->requested_max_size = in->wanted_max_size;
-    ldout(cct, 15) << "auth cap, setting max_size = " << in->requested_max_size << dendl;
+    if (want & CEPH_CAP_ANY_FILE_WR) {
+      m->set_max_size(in->wanted_max_size);
+      in->requested_max_size = in->wanted_max_size;
+      ldout(cct, 15) << "auth cap, requesting max_size " << in->requested_max_size << dendl;
+    } else {
+      in->requested_max_size = 0;
+      ldout(cct, 15) << "auth cap, reset requested_max_size due to not wanting any file write cap" << dendl;
+    }
   }
 
   if (!session->flushing_caps_tids.empty())
@@ -3527,8 +3556,6 @@ void Client::check_caps(Inode *in, unsigned flags)
       used &= ~(CEPH_CAP_FILE_CACHE | CEPH_CAP_FILE_LAZYIO);
   }
 
-  if (!in->cap_snaps.empty())
-    flush_snaps(in);
 
   for (auto &p : in->caps) {
     mds_rank_t mds = p.first;
@@ -3585,30 +3612,31 @@ void Client::check_caps(Inode *in, unsigned flags)
     }
 
   ack:
-    // re-send old cap/snapcap flushes first.
-    if (session->mds_state >= MDSMap::STATE_RECONNECT &&
-	session->mds_state < MDSMap::STATE_ACTIVE &&
-	session->early_flushing_caps.count(in) == 0) {
-      ldout(cct, 20) << " reflushing caps (check_caps) on " << *in
-		     << " to mds." << session->mds_num << dendl;
-      session->early_flushing_caps.insert(in);
-      if (in->cap_snaps.size())
-	flush_snaps(in, true);
-      if (in->flushing_caps)
-	flush_caps(in, session, flags & CHECK_CAPS_SYNCHRONOUS);
+    if (&cap == in->auth_cap) {
+      if (in->flags & I_KICK_FLUSH) {
+	ldout(cct, 20) << " reflushing caps (check_caps) on " << *in
+		       << " to mds." << mds << dendl;
+	kick_flushing_caps(in, session);
+      }
+      if (!in->cap_snaps.empty() &&
+	  in->cap_snaps.rbegin()->second.flush_tid == 0)
+	flush_snaps(in);
     }
 
     int flushing;
+    int msg_flags = 0;
     ceph_tid_t flush_tid;
     if (in->auth_cap == &cap && in->dirty_caps) {
       flushing = mark_caps_flushing(in, &flush_tid);
+      if (flags & CHECK_CAPS_SYNCHRONOUS)
+	msg_flags |= MClientCaps::FLAG_SYNC;
     } else {
       flushing = 0;
       flush_tid = 0;
     }
 
-    send_cap(in, session, &cap, flags & CHECK_CAPS_SYNCHRONOUS, cap_used, wanted,
-	     retain, flushing, flush_tid);
+    send_cap(in, session, &cap, msg_flags, cap_used, wanted, retain,
+	     flushing, flush_tid);
   }
 }
 
@@ -3693,23 +3721,63 @@ void Client::_flushed_cap_snap(Inode *in, snapid_t seq)
   flush_snaps(in);
 }
 
-void Client::flush_snaps(Inode *in, bool all_again)
+void Client::send_flush_snap(Inode *in, MetaSession *session,
+			     snapid_t follows, CapSnap& capsnap)
 {
-  ldout(cct, 10) << "flush_snaps on " << *in << " all_again " << all_again << dendl;
+  auto m = MClientCaps::create(CEPH_CAP_OP_FLUSHSNAP,
+                               in->ino, in->snaprealm->ino, 0,
+                               in->auth_cap->mseq, cap_epoch_barrier);
+  m->caller_uid = capsnap.cap_dirtier_uid;
+  m->caller_gid = capsnap.cap_dirtier_gid;
+
+  m->set_client_tid(capsnap.flush_tid);
+  m->head.snap_follows = follows;
+
+  m->head.caps = capsnap.issued;
+  m->head.dirty = capsnap.dirty;
+
+  m->head.uid = capsnap.uid;
+  m->head.gid = capsnap.gid;
+  m->head.mode = capsnap.mode;
+  m->btime = capsnap.btime;
+
+  m->size = capsnap.size;
+
+  m->head.xattr_version = capsnap.xattr_version;
+  encode(capsnap.xattrs, m->xattrbl);
+
+  m->ctime = capsnap.ctime;
+  m->btime = capsnap.btime;
+  m->mtime = capsnap.mtime;
+  m->atime = capsnap.atime;
+  m->time_warp_seq = capsnap.time_warp_seq;
+  m->change_attr = capsnap.change_attr;
+
+  if (capsnap.dirty & CEPH_CAP_FILE_WR) {
+    m->inline_version = in->inline_version;
+    m->inline_data = in->inline_data;
+  }
+
+  ceph_assert(!session->flushing_caps_tids.empty());
+  m->set_oldest_flush_tid(*session->flushing_caps_tids.begin());
+
+  session->con->send_message2(std::move(m));
+}
+
+void Client::flush_snaps(Inode *in)
+{
+  ldout(cct, 10) << "flush_snaps on " << *in << dendl;
   ceph_assert(in->cap_snaps.size());
 
   // pick auth mds
   ceph_assert(in->auth_cap);
   MetaSession *session = in->auth_cap->session;
-  int mseq = in->auth_cap->mseq;
 
   for (auto &p : in->cap_snaps) {
     CapSnap &capsnap = p.second;
-    if (!all_again) {
-      // only flush once per session
-      if (capsnap.flush_tid > 0)
-	continue;
-    }
+    // only do new flush
+    if (capsnap.flush_tid > 0)
+      continue;
 
     ldout(cct, 10) << "flush_snaps mds." << session->mds_num
 	     << " follows " << p.first
@@ -3719,56 +3787,17 @@ void Client::flush_snaps(Inode *in, bool all_again)
 	     << " writing=" << capsnap.writing
 	     << " on " << *in << dendl;
     if (capsnap.dirty_data || capsnap.writing)
-      continue;
+      break;
     
-    if (capsnap.flush_tid == 0) {
-      capsnap.flush_tid = ++last_flush_tid;
-      if (!in->flushing_cap_item.is_on_list())
-	session->flushing_caps.push_back(&in->flushing_cap_item);
-      session->flushing_caps_tids.insert(capsnap.flush_tid);
-    }
+    capsnap.flush_tid = ++last_flush_tid;
+    session->flushing_caps_tids.insert(capsnap.flush_tid);
+    in->flushing_cap_tids[capsnap.flush_tid] = 0;
+    if (!in->flushing_cap_item.is_on_list())
+      session->flushing_caps.push_back(&in->flushing_cap_item);
 
-    auto m = MClientCaps::create(CEPH_CAP_OP_FLUSHSNAP, in->ino, in->snaprealm->ino, 0, mseq,
-				     cap_epoch_barrier);
-    m->caller_uid = capsnap.cap_dirtier_uid;
-    m->caller_gid = capsnap.cap_dirtier_gid;
-
-    m->set_client_tid(capsnap.flush_tid);
-    m->head.snap_follows = p.first;
-
-    m->head.caps = capsnap.issued;
-    m->head.dirty = capsnap.dirty;
-
-    m->head.uid = capsnap.uid;
-    m->head.gid = capsnap.gid;
-    m->head.mode = capsnap.mode;
-    m->btime = capsnap.btime;
-
-    m->size = capsnap.size;
-
-    m->head.xattr_version = capsnap.xattr_version;
-    encode(capsnap.xattrs, m->xattrbl);
-
-    m->ctime = capsnap.ctime;
-    m->btime = capsnap.btime;
-    m->mtime = capsnap.mtime;
-    m->atime = capsnap.atime;
-    m->time_warp_seq = capsnap.time_warp_seq;
-    m->change_attr = capsnap.change_attr;
-
-    if (capsnap.dirty & CEPH_CAP_FILE_WR) {
-      m->inline_version = in->inline_version;
-      m->inline_data = in->inline_data;
-    }
-
-    ceph_assert(!session->flushing_caps_tids.empty());
-    m->set_oldest_flush_tid(*session->flushing_caps_tids.begin());
-
-    session->con->send_message2(std::move(m));
+    send_flush_snap(in, session, p.first, capsnap);
   }
 }
-
-
 
 void Client::wait_on_list(list<Cond*>& ls)
 {
@@ -4013,7 +4042,9 @@ void Client::add_update_cap(Inode *in, MetaSession *mds_session, uint64_t cap_id
      * don't remove caps.
      */
     if (ceph_seq_cmp(seq, cap.seq) <= 0) {
-      ceph_assert(&cap == in->auth_cap);
+      if (&cap != in->auth_cap)
+         ldout(cct, 0) << "WARNING: " <<  "inode " << *in << " caps on mds." << mds << " != auth_cap." << dendl;
+
       ceph_assert(cap.cap_id == cap_id);
       seq = cap.seq;
       mseq = cap.mseq;
@@ -4119,9 +4150,8 @@ void Client::remove_session_caps(MetaSession *s)
   while (s->caps.size()) {
     Cap *cap = *s->caps.begin();
     InodeRef in(&cap->inode);
-    bool dirty_caps = false, cap_snaps = false;
+    bool dirty_caps = false;
     if (in->auth_cap == cap) {
-      cap_snaps = !in->cap_snaps.empty();
       dirty_caps = in->dirty_caps | in->flushing_caps;
       in->wanted_max_size = 0;
       in->requested_max_size = 0;
@@ -4129,9 +4159,7 @@ void Client::remove_session_caps(MetaSession *s)
     if (cap->wanted | cap->issued)
       in->flags |= I_CAP_DROPPED;
     remove_cap(cap, false);
-    if (cap_snaps) {
-      in->cap_snaps.clear();
-    }
+    in->cap_snaps.clear();
     if (dirty_caps) {
       lderr(cct) << __func__ << " still has dirty|flushing caps on " << *in << dendl;
       if (in->flushing_caps) {
@@ -4236,6 +4264,39 @@ void Client::_trim_negative_child_dentries(InodeRef& in)
   }
 }
 
+class C_Client_CacheRelease : public Context  {
+private:
+  Client *client;
+  vinodeno_t ino;
+public:
+  C_Client_CacheRelease(Client *c, Inode *in) :
+    client(c) {
+    if (client->use_faked_inos())
+      ino = vinodeno_t(in->faked_ino, CEPH_NOSNAP);
+    else
+      ino = in->vino();
+  }
+  void finish(int r) override {
+    ceph_assert(ceph_mutex_is_not_locked_by_me(client->client_lock));
+    client->_async_inode_release(ino);
+  }
+};
+
+void Client::_async_inode_release(vinodeno_t ino)
+{
+  if (unmounting)
+    return;
+  ldout(cct, 10) << __func__ << " " << ino << dendl;
+  ino_release_cb(callback_handle, ino);
+}
+
+void Client::_schedule_ino_release_callback(Inode *in) {
+
+  if (ino_release_cb)
+    // we queue the invalidate, which calls the callback and decrements the ref
+    async_ino_releasor.queue(new C_Client_CacheRelease(this, in));
+}
+
 void Client::trim_caps(MetaSession *s, uint64_t max)
 {
   mds_rank_t mds = s->mds_num;
@@ -4290,6 +4351,7 @@ void Client::trim_caps(MetaSession *s, uint64_t max)
       if (all && in->ino != MDS_INO_ROOT) {
         ldout(cct, 20) << __func__ << " counting as trimmed: " << *in << dendl;
 	trimmed++;
+	_schedule_ino_release_callback(in.get());
       }
     }
   }
@@ -4393,28 +4455,6 @@ void Client::flush_caps_sync()
   }
 }
 
-void Client::flush_caps(Inode *in, MetaSession *session, bool sync)
-{
-  ldout(cct, 10) << __func__ << " " << in << " mds." << session->mds_num << dendl;
-  Cap *cap = in->auth_cap;
-  ceph_assert(cap->session == session);
-
-  for (map<ceph_tid_t,int>::iterator p = in->flushing_cap_tids.begin();
-       p != in->flushing_cap_tids.end();
-       ++p) {
-    bool req_sync = false;
-
-    /* If this is a synchronous request, then flush the journal on last one */
-    if (sync && (p->first == in->flushing_cap_tids.rbegin()->first))
-      req_sync = true;
-
-    send_cap(in, session, cap, req_sync,
-	     (get_caps_used(in) | in->caps_dirty()),
-	     in->caps_wanted(), (cap->issued | cap->implemented),
-	     p->second, p->first);
-  }
-}
-
 void Client::wait_sync_caps(Inode *in, ceph_tid_t want)
 {
   while (in->flushing_caps) {
@@ -4448,6 +4488,40 @@ void Client::wait_sync_caps(ceph_tid_t want)
   }
 }
 
+void Client::kick_flushing_caps(Inode *in, MetaSession *session)
+{
+  in->flags &= ~I_KICK_FLUSH;
+
+  Cap *cap = in->auth_cap;
+  ceph_assert(cap->session == session);
+
+  ceph_tid_t last_snap_flush = 0;
+  for (auto p = in->flushing_cap_tids.rbegin();
+       p != in->flushing_cap_tids.rend();
+       ++p) {
+    if (!p->second) {
+      last_snap_flush = p->first;
+      break;
+    }
+  }
+
+  int wanted = in->caps_wanted();
+  int used = get_caps_used(in) | in->caps_dirty();
+  auto it = in->cap_snaps.begin();
+  for (auto& p : in->flushing_cap_tids) {
+    if (p.second) {
+      int msg_flags = p.first < last_snap_flush ? MClientCaps::FLAG_PENDING_CAPSNAP : 0;
+      send_cap(in, session, cap, msg_flags, used, wanted, (cap->issued | cap->implemented),
+	       p.second, p.first);
+    } else {
+      ceph_assert(it != in->cap_snaps.end());
+      ceph_assert(it->second.flush_tid == p.first);
+      send_flush_snap(in, session, it->first, it->second);
+      ++it;
+    }
+  }
+}
+
 void Client::kick_flushing_caps(MetaSession *session)
 {
   mds_rank_t mds = session->mds_num;
@@ -4455,22 +4529,15 @@ void Client::kick_flushing_caps(MetaSession *session)
 
   for (xlist<Inode*>::iterator p = session->flushing_caps.begin(); !p.end(); ++p) {
     Inode *in = *p;
-    if (session->early_flushing_caps.count(in))
-      continue;
-    ldout(cct, 20) << " reflushing caps on " << *in << " to mds." << mds << dendl;
-    if (in->cap_snaps.size())
-      flush_snaps(in, true);
-    if (in->flushing_caps)
-      flush_caps(in, session);
+    if (in->flags & I_KICK_FLUSH) {
+      ldout(cct, 20) << " reflushing caps on " << *in << " to mds." << mds << dendl;
+      kick_flushing_caps(in, session);
+    }
   }
-
-  session->early_flushing_caps.clear();
 }
 
 void Client::early_kick_flushing_caps(MetaSession *session)
 {
-  session->early_flushing_caps.clear();
-
   for (xlist<Inode*>::iterator p = session->flushing_caps.begin(); !p.end(); ++p) {
     Inode *in = *p;
     Cap *cap = in->auth_cap;
@@ -4479,14 +4546,13 @@ void Client::early_kick_flushing_caps(MetaSession *session)
     // if flushing caps were revoked, we re-send the cap flush in client reconnect
     // stage. This guarantees that MDS processes the cap flush message before issuing
     // the flushing caps to other client.
-    if ((in->flushing_caps & in->auth_cap->issued) == in->flushing_caps)
+    if ((in->flushing_caps & in->auth_cap->issued) == in->flushing_caps) {
+      in->flags |= I_KICK_FLUSH;
       continue;
+    }
 
     ldout(cct, 20) << " reflushing caps (early_kick) on " << *in
 		   << " to mds." << session->mds_num << dendl;
-
-    session->early_flushing_caps.insert(in);
-
     // send_reconnect() also will reset these sequence numbers. make sure
     // sequence numbers in cap flush message match later reconnect message.
     cap->seq = 0;
@@ -4494,11 +4560,7 @@ void Client::early_kick_flushing_caps(MetaSession *session)
     cap->mseq = 0;
     cap->issued = cap->implemented;
 
-    if (in->cap_snaps.size())
-      flush_snaps(in, true);
-    if (in->flushing_caps)
-      flush_caps(in, session);
-
+    kick_flushing_caps(in, session);
   }
 }
 
@@ -4883,8 +4945,10 @@ void Client::handle_cap_import(MetaSession *session, Inode *in, const MConstRef<
   SnapRealm *realm = NULL;
   update_snap_trace(m->snapbl, &realm);
 
+  int issued = m->get_caps();
+  int wanted = m->get_wanted();
   add_update_cap(in, session, m->get_cap_id(),
-		 m->get_caps(), m->get_wanted(), m->get_seq(), m->get_mseq(),
+		 issued, wanted, m->get_seq(), m->get_mseq(),
 		 m->get_realm(), CEPH_CAP_FLAG_AUTH, cap_perms);
   
   if (cap && cap->cap_id == m->peer.cap_id) {
@@ -4894,12 +4958,14 @@ void Client::handle_cap_import(MetaSession *session, Inode *in, const MConstRef<
   if (realm)
     put_snap_realm(realm);
   
-  if (in->auth_cap && in->auth_cap->session->mds_num == mds) {
+  if (in->auth_cap && in->auth_cap->session == session) {
+    if (!(wanted & CEPH_CAP_ANY_FILE_WR) ||
+	in->requested_max_size > m->get_max_size()) {
+      in->requested_max_size = 0;
+      ldout(cct, 15) << "reset requested_max_size after cap import" << dendl;
+    }
     // reflush any/all caps (if we are now the auth_cap)
-    if (in->cap_snaps.size())
-      flush_snaps(in, true);
-    if (in->flushing_caps)
-      flush_caps(in, session);
+    kick_flushing_caps(in, session);
   }
 }
 
@@ -4978,6 +5044,11 @@ void Client::handle_cap_flush_ack(MetaSession *session, Inode *in, Cap *cap, con
                    << " expected is " << it->first << dendl;
   }
   for (; it != in->flushing_cap_tids.end(); ) {
+    if (!it->second) {
+      // cap snap
+      ++it;
+      continue;
+    }
     if (it->first == flush_ack_tid)
       cleaned = it->second;
     if (it->first <= flush_ack_tid) {
@@ -5018,7 +5089,7 @@ void Client::handle_cap_flush_ack(MetaSession *session, Inode *in, Cap *cap, con
       if (in->flushing_caps == 0) {
 	ldout(cct, 10) << " " << *in << " !flushing" << dendl;
 	num_flushing_caps--;
-	if (in->cap_snaps.empty())
+       if (in->flushing_cap_tids.empty())
 	  in->flushing_cap_item.remove_myself();
       }
       if (!in->caps_dirty())
@@ -5030,24 +5101,29 @@ void Client::handle_cap_flush_ack(MetaSession *session, Inode *in, Cap *cap, con
 
 void Client::handle_cap_flushsnap_ack(MetaSession *session, Inode *in, const MConstRef<MClientCaps>& m)
 {
+  ceph_tid_t flush_ack_tid = m->get_client_tid();
   mds_rank_t mds = session->mds_num;
   ceph_assert(in->caps.count(mds));
   snapid_t follows = m->get_snap_follows();
 
   if (auto it = in->cap_snaps.find(follows); it != in->cap_snaps.end()) {
     auto& capsnap = it->second;
-    if (m->get_client_tid() != capsnap.flush_tid) {
-      ldout(cct, 10) << " tid " << m->get_client_tid() << " != " << capsnap.flush_tid << dendl;
+    if (flush_ack_tid != capsnap.flush_tid) {
+      ldout(cct, 10) << " tid " << flush_ack_tid << " != " << capsnap.flush_tid << dendl;
     } else {
+      InodeRef tmp_ref(in);
       ldout(cct, 5) << __func__ << " mds." << mds << " flushed snap follows " << follows
 	      << " on " << *in << dendl;
-      InodeRef tmp_ref;
-      if (in->get_num_ref() == 1)
-	tmp_ref = in; // make sure inode not get freed while erasing item from in->cap_snaps
-      if (in->flushing_caps == 0 && in->cap_snaps.empty())
-	in->flushing_cap_item.remove_myself();
       session->flushing_caps_tids.erase(capsnap.flush_tid);
+      in->flushing_cap_tids.erase(capsnap.flush_tid);
+      if (in->flushing_caps == 0 && in->flushing_cap_tids.empty())
+	in->flushing_cap_item.remove_myself();
       in->cap_snaps.erase(it);
+
+      signal_cond_list(in->waitfor_caps);
+      if (session->flushing_caps_tids.empty() ||
+	  *session->flushing_caps_tids.begin() > flush_ack_tid)
+	sync_cond.Signal();
     }
   } else {
     ldout(cct, 5) << __func__ << " DUP(?) mds." << mds << " flushed snap follows " << follows
@@ -5090,7 +5166,7 @@ void Client::_async_dentry_invalidate(vinodeno_t dirino, vinodeno_t ino, string&
     return;
   ldout(cct, 10) << __func__ << " '" << name << "' ino " << ino
 		 << " in dir " << dirino << dendl;
-  dentry_invalidate_cb(callback_handle, dirino, ino, name);
+  dentry_invalidate_cb(callback_handle, dirino, ino, name.c_str(), name.length());
 }
 
 void Client::_schedule_invalidate_dentry_callback(Dentry *dn, bool del)
@@ -5158,7 +5234,7 @@ void Client::handle_cap_grant(MetaSession *session, Inode *in, Cap *cap, const M
 		<< " mds." << mds << " seq " << m->get_seq()
 		<< " caps now " << ccap_string(new_caps)
 		<< " was " << ccap_string(cap->issued)
-		<< (was_stale ? "" : " (stale)") << dendl;
+		<< (was_stale ? " (stale)" : "") << dendl;
 
   if (was_stale)
       cap->issued = cap->implemented = CEPH_CAP_PIN;
@@ -6325,7 +6401,7 @@ int Client::_lookup(Inode *dir, const string& dname, int mask, InodeRef *target,
 	ldout(cct, 20) << " bad lease, cap_ttl " << s.cap_ttl << ", cap_gen " << s.cap_gen
 		       << " vs lease_gen " << dn->lease_gen << dendl;
       }
-      // dir lease?
+      // dir shared caps?
       if (dir->caps_issued_mask(CEPH_CAP_FILE_SHARED, true)) {
 	if (dn->cap_shared_gen == dir->shared_gen &&
 	    (!dn->inode || dn->inode->caps_issued_mask(mask, true)))
@@ -7991,21 +8067,27 @@ int Client::_readdir_cache_cb(dir_result_t *dirp, add_dirent_cb_t cb, void *p,
       continue;
     }
 
+    int idx = pd - dir->readdir_cache.begin();
     int r = _getattr(dn->inode, caps, dirp->perms);
     if (r < 0)
       return r;
+    
+    // the content of readdir_cache may change after _getattr(), so pd may be invalid iterator    
+    pd = dir->readdir_cache.begin() + idx;
+    if (pd >= dir->readdir_cache.end() || *pd != dn)
+      return -EAGAIN;
 
     struct ceph_statx stx;
     struct dirent de;
     fill_statx(dn->inode, caps, &stx);
 
     uint64_t next_off = dn->offset + 1;
+    fill_dirent(&de, dn->name.c_str(), stx.stx_mode, stx.stx_ino, next_off);
     ++pd;
     if (pd == dir->readdir_cache.end())
       next_off = dir_result_t::END;
 
     Inode *in = NULL;
-    fill_dirent(&de, dn->name.c_str(), stx.stx_mode, stx.stx_ino, next_off);
     if (getref) {
       in = dn->inode.get();
       _ll_get(in);
@@ -8868,8 +8950,13 @@ loff_t Client::lseek(int fd, loff_t offset, int whence)
 loff_t Client::_lseek(Fh *f, loff_t offset, int whence)
 {
   Inode *in = f->inode.get();
-  int r;
   loff_t pos = -1;
+
+  if (whence == SEEK_END || whence == SEEK_DATA || whence == SEEK_HOLE) {
+    int r = _getattr(in, CEPH_STAT_CAP_SIZE, f->actor_perms);
+    if (r < 0)
+      return r;
+  }
 
   switch (whence) {
   case SEEK_SET:
@@ -8877,18 +8964,28 @@ loff_t Client::_lseek(Fh *f, loff_t offset, int whence)
     break;
 
   case SEEK_CUR:
-    pos += offset;
+    pos = f->pos + offset;
     break;
 
   case SEEK_END:
-    r = _getattr(in, CEPH_STAT_CAP_SIZE, f->actor_perms);
-    if (r < 0)
-      return r;
     pos = in->size + offset;
     break;
 
+  case SEEK_DATA:
+    if (offset < 0 || offset >= in->size)
+      return -ENXIO;
+    pos = offset;
+    break;
+
+  case SEEK_HOLE:
+    if (offset < 0 || offset >= in->size)
+      return -ENXIO;
+    pos = in->size;
+    break;
+
   default:
-    ceph_abort();
+    ldout(cct, 1) << __func__ << ": invalid whence value " << whence << dendl;
+    return -EINVAL;
   }
 
   if (pos < 0) {
@@ -9852,6 +9949,10 @@ int Client::chdir(const char *relpath, std::string &new_cwd,
   int r = path_walk(path, &in, perms);
   if (r < 0)
     return r;
+
+  if (!(in.get()->is_dir()))
+    return -ENOTDIR;
+
   if (cwd != in)
     cwd.swap(in);
   ldout(cct, 3) << "chdir(" << relpath << ")  cwd now " << cwd->ino << dendl;
@@ -10319,7 +10420,7 @@ int Client::ll_statfs(Inode *in, struct statvfs *stbuf, const UserPerm& perms)
   return statfs(0, stbuf, perms);
 }
 
-void Client::ll_register_callbacks(struct client_callback_args *args)
+void Client::ll_register_callbacks(struct ceph_client_callback_args *args)
 {
   if (!args)
     return;
@@ -10347,7 +10448,12 @@ void Client::ll_register_callbacks(struct client_callback_args *args)
     remount_cb = args->remount_cb;
     remount_finisher.start();
   }
-  umask_cb = args->umask_cb;
+  if (args->ino_release_cb) {
+    ino_release_cb = args->ino_release_cb;
+    async_ino_releasor.start();
+  }
+  if (args->umask_cb)
+    umask_cb = args->umask_cb;
 }
 
 int Client::test_dentry_handling(bool can_invalidate)
@@ -10459,10 +10565,10 @@ int Client::ll_lazyio(Fh *fh, int enable)
   return _lazyio(fh, enable);
 }
 
-int Client::lazyio_propogate(int fd, loff_t offset, size_t count)
+int Client::lazyio_propagate(int fd, loff_t offset, size_t count)
 {
   std::lock_guard l(client_lock);
-  ldout(cct, 3) << "op: client->lazyio_propogate(" << fd
+  ldout(cct, 3) << "op: client->lazyio_propagate(" << fd
           << ", " << offset << ", " << count << ")" << dendl;
   
   Fh *f = get_filehandle(fd);
@@ -10487,8 +10593,11 @@ int Client::lazyio_synchronize(int fd, loff_t offset, size_t count)
   Inode *in = f->inode.get();
   
   _fsync(f, true);
-  if (_release(in))
-    check_caps(in, 0);
+  if (_release(in)) {
+    int r =_getattr(in, CEPH_STAT_CAP_SIZE, f->actor_perms);
+    if (r < 0) 
+      return r;
+  }
   return 0;
 }
 
@@ -10619,8 +10728,6 @@ int Client::ll_lookup(Inode *parent, const char *name, struct stat *attr,
     return -ENOTCONN;
 
   int r = 0;
-  auto fuse_default_permissions = cct->_conf.get_val<bool>(
-    "fuse_default_permissions");
   if (!fuse_default_permissions) {
     if (strcmp(name, ".") && strcmp(name, "..")) {
       r = may_lookup(parent, perms);
@@ -10716,8 +10823,6 @@ int Client::ll_lookupx(Inode *parent, const char *name, Inode **out,
     return -ENOTCONN;
 
   int r = 0;
-  auto fuse_default_permissions = cct->_conf.get_val<bool>(
-    "fuse_default_permissions");
   if (!fuse_default_permissions) {
     r = may_lookup(parent, perms);
     if (r < 0)
@@ -10988,8 +11093,6 @@ int Client::_ll_setattrx(Inode *in, struct ceph_statx *stx, int mask,
   tout(cct) << stx->stx_btime << std::endl;
   tout(cct) << mask << std::endl;
 
-  auto fuse_default_permissions = cct->_conf.get_val<bool>(
-    "fuse_default_permissions");
   if (!fuse_default_permissions) {
     int res = may_setattr(in, stx, mask, perms);
     if (res < 0)
@@ -11315,8 +11418,6 @@ int Client::ll_getxattr(Inode *in, const char *name, void *value,
   tout(cct) << vino.ino.val << std::endl;
   tout(cct) << name << std::endl;
 
-  auto fuse_default_permissions = cct->_conf.get_val<bool>(
-    "fuse_default_permissions");
   if (!fuse_default_permissions) {
     int r = xattr_permission(in, name, MAY_READ, perms);
     if (r < 0)
@@ -11594,8 +11695,6 @@ int Client::ll_setxattr(Inode *in, const char *name, const void *value,
   tout(cct) << vino.ino.val << std::endl;
   tout(cct) << name << std::endl;
 
-  auto fuse_default_permissions = cct->_conf.get_val<bool>(
-    "fuse_default_permissions");
   if (!fuse_default_permissions) {
     int r = xattr_permission(in, name, MAY_WRITE, perms);
     if (r < 0)
@@ -11660,8 +11759,6 @@ int Client::ll_removexattr(Inode *in, const char *name, const UserPerm& perms)
   tout(cct) << vino.ino.val << std::endl;
   tout(cct) << name << std::endl;
 
-  auto fuse_default_permissions = cct->_conf.get_val<bool>(
-    "fuse_default_permissions");
   if (!fuse_default_permissions) {
     int r = xattr_permission(in, name, MAY_WRITE, perms);
     if (r < 0)
@@ -12032,8 +12129,6 @@ int Client::ll_mknod(Inode *parent, const char *name, mode_t mode,
   tout(cct) << mode << std::endl;
   tout(cct) << rdev << std::endl;
 
-  auto fuse_default_permissions = cct->_conf.get_val<bool>(
-    "fuse_default_permissions");
   if (!fuse_default_permissions) {
     int r = may_create(parent, perms);
     if (r < 0)
@@ -12073,8 +12168,6 @@ int Client::ll_mknodx(Inode *parent, const char *name, mode_t mode,
   tout(cct) << mode << std::endl;
   tout(cct) << rdev << std::endl;
 
-  auto fuse_default_permissions = cct->_conf.get_val<bool>(
-    "fuse_default_permissions");
   if (!fuse_default_permissions) {
     int r = may_create(parent, perms);
     if (r < 0)
@@ -12262,8 +12355,6 @@ int Client::ll_mkdir(Inode *parent, const char *name, mode_t mode,
   tout(cct) << name << std::endl;
   tout(cct) << mode << std::endl;
 
-  auto fuse_default_permissions = cct->_conf.get_val<bool>(
-    "fuse_default_permissions");
   if (!fuse_default_permissions) {
     int r = may_create(parent, perm);
     if (r < 0)
@@ -12300,8 +12391,6 @@ int Client::ll_mkdirx(Inode *parent, const char *name, mode_t mode, Inode **out,
   tout(cct) << name << std::endl;
   tout(cct) << mode << std::endl;
 
-  auto fuse_default_permissions = cct->_conf.get_val<bool>(
-    "fuse_default_permissions");
   if (!fuse_default_permissions) {
     int r = may_create(parent, perms);
     if (r < 0)
@@ -12387,8 +12476,6 @@ int Client::ll_symlink(Inode *parent, const char *name, const char *value,
   tout(cct) << name << std::endl;
   tout(cct) << value << std::endl;
 
-  auto fuse_default_permissions = cct->_conf.get_val<bool>(
-    "fuse_default_permissions");
   if (!fuse_default_permissions) {
     int r = may_create(parent, perms);
     if (r < 0)
@@ -12426,8 +12513,6 @@ int Client::ll_symlinkx(Inode *parent, const char *name, const char *value,
   tout(cct) << name << std::endl;
   tout(cct) << value << std::endl;
 
-  auto fuse_default_permissions = cct->_conf.get_val<bool>(
-    "fuse_default_permissions");
   if (!fuse_default_permissions) {
     int r = may_create(parent, perms);
     if (r < 0)
@@ -12511,8 +12596,6 @@ int Client::ll_unlink(Inode *in, const char *name, const UserPerm& perm)
   tout(cct) << vino.ino.val << std::endl;
   tout(cct) << name << std::endl;
 
-  auto fuse_default_permissions = cct->_conf.get_val<bool>(
-    "fuse_default_permissions");
   if (!fuse_default_permissions) {
     int r = may_delete(in, name, perm);
     if (r < 0)
@@ -12588,8 +12671,6 @@ int Client::ll_rmdir(Inode *in, const char *name, const UserPerm& perms)
   tout(cct) << vino.ino.val << std::endl;
   tout(cct) << name << std::endl;
 
-  auto fuse_default_permissions = cct->_conf.get_val<bool>(
-    "fuse_default_permissions");
   if (!fuse_default_permissions) {
     int r = may_delete(in, name, perms);
     if (r < 0)
@@ -12725,8 +12806,6 @@ int Client::ll_rename(Inode *parent, const char *name, Inode *newparent,
   tout(cct) << vnewparent.ino.val << std::endl;
   tout(cct) << newname << std::endl;
 
-  auto fuse_default_permissions = cct->_conf.get_val<bool>(
-    "fuse_default_permissions");
   if (!fuse_default_permissions) {
     int r = may_delete(parent, name, perm);
     if (r < 0)
@@ -12804,8 +12883,6 @@ int Client::ll_link(Inode *in, Inode *newparent, const char *newname,
 
   InodeRef target;
 
-  auto fuse_default_permissions = cct->_conf.get_val<bool>(
-    "fuse_default_permissions");
   if (!fuse_default_permissions) {
     if (S_ISDIR(in->mode))
       return -EPERM;
@@ -12935,8 +13012,6 @@ int Client::ll_opendir(Inode *in, int flags, dir_result_t** dirpp,
   tout(cct) << "ll_opendir" << std::endl;
   tout(cct) << vino.ino.val << std::endl;
 
-  auto fuse_default_permissions = cct->_conf.get_val<bool>(
-    "fuse_default_permissions");
   if (!fuse_default_permissions) {
     int r = may_open(in, flags, perms);
     if (r < 0)
@@ -12995,8 +13070,6 @@ int Client::ll_open(Inode *in, int flags, Fh **fhp, const UserPerm& perms)
   tout(cct) << ceph_flags_sys2wire(flags) << std::endl;
 
   int r;
-  auto fuse_default_permissions = cct->_conf.get_val<bool>(
-    "fuse_default_permissions");
   if (!fuse_default_permissions) {
     r = may_open(in, flags, perms);
     if (r < 0)
@@ -13040,8 +13113,6 @@ int Client::_ll_create(Inode *parent, const char *name, mode_t mode,
     return -EEXIST;
 
   if (r == -ENOENT && (flags & O_CREAT)) {
-    auto fuse_default_permissions = cct->_conf.get_val<bool>(
-      "fuse_default_permissions");
     if (!fuse_default_permissions) {
       r = may_create(parent, perms);
       if (r < 0)
@@ -13060,8 +13131,6 @@ int Client::_ll_create(Inode *parent, const char *name, mode_t mode,
 
   ldout(cct, 20) << "_ll_create created = " << created << dendl;
   if (!created) {
-    auto fuse_default_permissions = cct->_conf.get_val<bool>(
-      "fuse_default_permissions");
     if (!fuse_default_permissions) {
       r = may_open(in->get(), flags, perms);
       if (r < 0) {
@@ -14548,8 +14617,7 @@ StandaloneClient::~StandaloneClient()
 
 int StandaloneClient::init()
 {
-  timer.init();
-  objectcacher->start();
+  _pre_init();
   objecter->init();
 
   client_lock.Lock();

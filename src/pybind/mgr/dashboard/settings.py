@@ -39,6 +39,7 @@ class Options(object):
     GRAFANA_API_URL = ('', str)
     GRAFANA_API_USERNAME = ('admin', str)
     GRAFANA_API_PASSWORD = ('admin', str)
+    GRAFANA_API_SSL_VERIFY = (True, bool)
     GRAFANA_UPDATE_DASHBOARDS = (False, bool)
 
     # NFS Ganesha settings
@@ -152,7 +153,8 @@ def options_schema_list():
     for option, value in inspect.getmembers(Options, filter_attr):
         if option.startswith('_'):
             continue
-        result.append({'name': option, 'default': value[0]})
+        result.append({'name': option, 'default': value[0],
+                       'type': value[1].__name__})
 
     return result
 

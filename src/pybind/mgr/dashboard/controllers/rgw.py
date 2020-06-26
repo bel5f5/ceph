@@ -10,7 +10,8 @@ from . import ApiController, BaseController, RESTController, Endpoint, \
 from .. import logger
 from ..exceptions import DashboardException
 from ..rest_client import RequestException
-from ..security import Scope
+from ..security import Scope, Permission
+from ..services.auth import AuthManager, JwtManager
 from ..services.ceph_service import CephService
 from ..services.rgw_client import RgwClient
 
@@ -121,6 +122,26 @@ class RgwBucket(RgwRESTController):
                 if bucket['tenant'] else bucket['bucket']
         return bucket
 
+    @staticmethod
+    def strip_tenant_from_bucket_name(bucket_name, uid):
+        # type (str, str) => str
+        """
+        When linking a bucket to a new user belonging to same tenant
+        as the previous owner, tenant must be removed from the bucket name.
+        >>> RgwBucket.strip_tenant_from_bucket_name('tenant/bucket-name', 'tenant$user1')
+        'bucket-name'
+        >>> RgwBucket.strip_tenant_from_bucket_name('tenant/bucket-name', 'tenant2$user2')
+        'tenant/bucket-name'
+        >>> RgwBucket.strip_tenant_from_bucket_name('bucket-name', 'user1')
+        'bucket-name'
+        """
+        bucket_tenant = bucket_name[:bucket_name.find('/')] if bucket_name.find('/') >= 0 else None
+        uid_tenant = uid[:uid.find('$')] if uid.find('$') >= 0 else None
+        if bucket_tenant and uid_tenant and bucket_tenant == uid_tenant:
+            return bucket_name[bucket_name.find('/') + 1:]
+
+        return bucket_name
+
     def list(self):
         return self.proxy('GET', 'bucket')
 
@@ -137,7 +158,7 @@ class RgwBucket(RgwRESTController):
 
     def set(self, bucket, bucket_id, uid):
         result = self.proxy('PUT', 'bucket', {
-            'bucket': bucket,
+            'bucket': RgwBucket.strip_tenant_from_bucket_name(bucket, uid),
             'bucket-id': bucket_id,
             'uid': uid
         }, json_response=False)
@@ -168,6 +189,13 @@ class RgwUser(RgwRESTController):
                 if user['tenant'] else user['user_id']
         return user
 
+    @staticmethod
+    def _keys_allowed():
+        permissions = AuthManager.get_user(JwtManager.get_username()).permissions_dict()
+        edit_permissions = [Permission.CREATE, Permission.UPDATE, Permission.DELETE]
+        return Scope.RGW in permissions and Permission.READ in permissions[Scope.RGW] \
+            and len(set(edit_permissions).intersection(set(permissions[Scope.RGW]))) > 0
+
     def list(self):
         users = []
         marker = None
@@ -188,6 +216,9 @@ class RgwUser(RgwRESTController):
 
     def get(self, uid):
         result = self.proxy('GET', 'user', {'uid': uid})
+        if not self._keys_allowed():
+            del result['keys']
+            del result['swift_keys']
         return self._append_uid(result)
 
     @Endpoint()

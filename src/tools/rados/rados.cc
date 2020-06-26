@@ -157,8 +157,8 @@ void usage(ostream& out)
 "\n"
 "SCRUB AND REPAIR:\n"
 "   list-inconsistent-pg <pool>      list inconsistent PGs in given pool\n"
-"   list-inconsistent-obj <pgid>     list inconsistent objects in given pg\n"
-"   list-inconsistent-snapset <pgid> list inconsistent snapsets in the given pg\n"
+"   list-inconsistent-obj <pgid>     list inconsistent objects in given PG\n"
+"   list-inconsistent-snapset <pgid> list inconsistent snapsets in the given PG\n"
 "\n"
 "CACHE POOLS: (for testing/development only)\n"
 "   cache-flush <obj-name>           flush cache pool object (blocking)\n"
@@ -175,11 +175,13 @@ void usage(ostream& out)
 "        select given pool by name\n"
 "   --target-pool=pool\n"
 "        select target pool by name\n"
+"   --pgid PG id\n"
+"        select given PG id\n"
 "   -f [--format plain|json|json-pretty]\n"
 "   --format=[--format plain|json|json-pretty]\n"
 "   -b op_size\n"
 "        set the block size for put/get ops and for write benchmarking\n"
-"   -o object_size\n"
+"   -O object_size\n"
 "        set the object size for put/get ops and for write benchmarking\n"
 "   --max-objects\n"
 "        set the max number of objects for write benchmarking\n"
@@ -1621,6 +1623,8 @@ static void dump_obj_errors(const obj_err_t &err, Formatter &f)
     f.dump_string("error", "snapset_inconsistency");
   if (err.has_hinfo_inconsistency())
     f.dump_string("error", "hinfo_inconsistency");
+  if (err.has_size_too_large())
+    f.dump_string("error", "size_too_large");
   f.close_section();
 }
 
@@ -2106,13 +2110,6 @@ static int rados_tool_common(const std::map < std::string, std::string > &opts,
     with_reference = true;
   }
 
-  i = opts.find("pgid");
-  boost::optional<pg_t> pgid(i != opts.end(), pg_t());
-  if (pgid && (!pgid->parse(i->second.c_str()) || (pool_name && rados.pool_lookup(pool_name) != pgid->pool()))) {
-    cerr << "invalid pgid" << std::endl;
-    return 1;
-  }
-
   // open rados
   ret = rados.init_with_context(g_ceph_context);
   if (ret < 0) {
@@ -2139,6 +2136,13 @@ static int rados_tool_common(const std::map < std::string, std::string > &opts,
 	   << cpp_strerror(ret) << std::endl;
       return 1;
     }
+  }
+
+  i = opts.find("pgid");
+  boost::optional<pg_t> pgid(i != opts.end(), pg_t());
+  if (pgid && (!pgid->parse(i->second.c_str()) || (pool_name && rados.pool_lookup(pool_name) != pgid->pool()))) {
+    cerr << "invalid pgid" << std::endl;
+    return 1;
   }
 
   // open io context.
@@ -3956,7 +3960,7 @@ int main(int argc, const char **argv)
       opts["max-objects"] = val;
     } else if (ceph_argparse_witharg(args, i, &val, "--offset", (char*)NULL)) {
       opts["offset"] = val;
-    } else if (ceph_argparse_witharg(args, i, &val, "-o", (char*)NULL)) {
+    } else if (ceph_argparse_witharg(args, i, &val, "-O", (char*)NULL)) {
       opts["object-size"] = val;
     } else if (ceph_argparse_witharg(args, i, &val, "-s", "--snap", (char*)NULL)) {
       opts["snap"] = val;

@@ -15,8 +15,22 @@
 
 #include "osd/osd_types.h"
 #include "osd/OSDMap.h"
+#include <boost/range/adaptor/reversed.hpp>
 
 #define dout_context g_ceph_context
+
+using std::list;
+using std::make_pair;
+using std::map;
+using std::pair;
+using std::ostream;
+using std::ostringstream;
+using std::set;
+using std::string;
+using std::stringstream;
+using std::vector;
+
+using ceph::bufferlist;
 
 MEMPOOL_DEFINE_OBJECT_FACTORY(PGMapDigest, pgmap_digest, pgmap);
 MEMPOOL_DEFINE_OBJECT_FACTORY(PGMap, pgmap, pgmap);
@@ -49,7 +63,7 @@ void PGMapDigest::encode(bufferlist& bl, uint64_t features) const
     uint32_t n = num_pg_by_state.size();
     encode(n, bl);
     for (auto p : num_pg_by_state) {
-      encode((uint32_t)p.first, bl);
+      encode((int32_t)p.first, bl);
       encode(p.second, bl);
     }
   }
@@ -107,7 +121,7 @@ void PGMapDigest::decode(bufferlist::const_iterator& p)
   DECODE_FINISH(p);
 }
 
-void PGMapDigest::dump(Formatter *f) const
+void PGMapDigest::dump(ceph::Formatter *f) const
 {
   f->dump_unsigned("num_pg", num_pg);
   f->dump_unsigned("num_pg_active", num_pg_active);
@@ -194,13 +208,13 @@ inline std::string percentify(const float& a) {
   return ss.str();
 }
 
-void PGMapDigest::print_summary(Formatter *f, ostream *out) const
+void PGMapDigest::print_summary(ceph::Formatter *f, ostream *out) const
 {
   if (f)
     f->open_array_section("pgs_by_state");
 
   // list is descending numeric order (by count)
-  multimap<int,int> state_by_count;  // count -> state
+  std::multimap<int,uint64_t> state_by_count;  // count -> state
   for (auto p = num_pg_by_state.begin();
        p != num_pg_by_state.end();
        ++p) {
@@ -285,18 +299,14 @@ void PGMapDigest::print_summary(Formatter *f, ostream *out) const
 
   if (!f) {
     unsigned max_width = 1;
-    for (multimap<int,int>::reverse_iterator p = state_by_count.rbegin();
-         p != state_by_count.rend();
-         ++p)
+    for (auto p = state_by_count.rbegin(); p != state_by_count.rend(); ++p)
     {
       std::stringstream ss;
       ss << p->first;
       max_width = std::max<size_t>(ss.str().size(), max_width);
     }
 
-    for (multimap<int,int>::reverse_iterator p = state_by_count.rbegin();
-         p != state_by_count.rend();
-         ++p)
+    for (auto p = state_by_count.rbegin(); p != state_by_count.rend(); ++p)
     {
       if (pad) {
         *out << "             ";
@@ -330,7 +340,7 @@ void PGMapDigest::print_summary(Formatter *f, ostream *out) const
     *out << "    cache:    " << ss_cache_io.str() << "\n";
 }
 
-void PGMapDigest::print_oneline_summary(Formatter *f, ostream *out) const
+void PGMapDigest::print_oneline_summary(ceph::Formatter *f, ostream *out) const
 {
   std::stringstream ss;
 
@@ -440,7 +450,7 @@ void PGMapDigest::get_recovery_stats(
   }
 }
 
-void PGMapDigest::recovery_summary(Formatter *f, list<string> *psl,
+void PGMapDigest::recovery_summary(ceph::Formatter *f, list<string> *psl,
                              const pool_stat_t& pool_sum) const
 {
   if (pool_sum.stats.sum.num_objects_degraded && pool_sum.stats.sum.num_object_copies > 0) {
@@ -493,7 +503,7 @@ void PGMapDigest::recovery_summary(Formatter *f, list<string> *psl,
   }
 }
 
-void PGMapDigest::recovery_rate_summary(Formatter *f, ostream *out,
+void PGMapDigest::recovery_rate_summary(ceph::Formatter *f, ostream *out,
                                   const pool_stat_t& delta_sum,
                                   utime_t delta_stamp) const
 {
@@ -524,17 +534,17 @@ void PGMapDigest::recovery_rate_summary(Formatter *f, ostream *out,
   }
 }
 
-void PGMapDigest::overall_recovery_rate_summary(Formatter *f, ostream *out) const
+void PGMapDigest::overall_recovery_rate_summary(ceph::Formatter *f, ostream *out) const
 {
   recovery_rate_summary(f, out, pg_sum_delta, stamp_delta);
 }
 
-void PGMapDigest::overall_recovery_summary(Formatter *f, list<string> *psl) const
+void PGMapDigest::overall_recovery_summary(ceph::Formatter *f, list<string> *psl) const
 {
   recovery_summary(f, psl, pg_sum);
 }
 
-void PGMapDigest::pool_recovery_rate_summary(Formatter *f, ostream *out,
+void PGMapDigest::pool_recovery_rate_summary(ceph::Formatter *f, ostream *out,
                                        uint64_t poolid) const
 {
   auto p = per_pool_sum_delta.find(poolid);
@@ -546,7 +556,7 @@ void PGMapDigest::pool_recovery_rate_summary(Formatter *f, ostream *out,
   recovery_rate_summary(f, out, p->second.first, ts->second);
 }
 
-void PGMapDigest::pool_recovery_summary(Formatter *f, list<string> *psl,
+void PGMapDigest::pool_recovery_summary(ceph::Formatter *f, list<string> *psl,
                                   uint64_t poolid) const
 {
   auto p = pg_pool_sum.find(poolid);
@@ -556,7 +566,7 @@ void PGMapDigest::pool_recovery_summary(Formatter *f, list<string> *psl,
   recovery_summary(f, psl, p->second);
 }
 
-void PGMapDigest::client_io_rate_summary(Formatter *f, ostream *out,
+void PGMapDigest::client_io_rate_summary(ceph::Formatter *f, ostream *out,
                                    const pool_stat_t& delta_sum,
                                    utime_t delta_stamp) const
 {
@@ -591,12 +601,12 @@ void PGMapDigest::client_io_rate_summary(Formatter *f, ostream *out,
   }
 }
 
-void PGMapDigest::overall_client_io_rate_summary(Formatter *f, ostream *out) const
+void PGMapDigest::overall_client_io_rate_summary(ceph::Formatter *f, ostream *out) const
 {
   client_io_rate_summary(f, out, pg_sum_delta, stamp_delta);
 }
 
-void PGMapDigest::pool_client_io_rate_summary(Formatter *f, ostream *out,
+void PGMapDigest::pool_client_io_rate_summary(ceph::Formatter *f, ostream *out,
                                         uint64_t poolid) const
 {
   auto p = per_pool_sum_delta.find(poolid);
@@ -608,7 +618,7 @@ void PGMapDigest::pool_client_io_rate_summary(Formatter *f, ostream *out,
   client_io_rate_summary(f, out, p->second.first, ts->second);
 }
 
-void PGMapDigest::cache_io_rate_summary(Formatter *f, ostream *out,
+void PGMapDigest::cache_io_rate_summary(ceph::Formatter *f, ostream *out,
                                   const pool_stat_t& delta_sum,
                                   utime_t delta_stamp) const
 {
@@ -688,12 +698,12 @@ void PGMapDigest::cache_io_rate_summary(Formatter *f, ostream *out,
   }
 }
 
-void PGMapDigest::overall_cache_io_rate_summary(Formatter *f, ostream *out) const
+void PGMapDigest::overall_cache_io_rate_summary(ceph::Formatter *f, ostream *out) const
 {
   cache_io_rate_summary(f, out, pg_sum_delta, stamp_delta);
 }
 
-void PGMapDigest::pool_cache_io_rate_summary(Formatter *f, ostream *out,
+void PGMapDigest::pool_cache_io_rate_summary(ceph::Formatter *f, ostream *out,
                                        uint64_t poolid) const
 {
   auto p = per_pool_sum_delta.find(poolid);
@@ -739,7 +749,7 @@ ceph_statfs PGMapDigest::get_statfs(OSDMap &osdmap,
 void PGMapDigest::dump_pool_stats_full(
   const OSDMap &osd_map,
   stringstream *ss,
-  Formatter *f,
+  ceph::Formatter *f,
   bool verbose) const
 {
   TextTable tbl;
@@ -819,7 +829,7 @@ void PGMapDigest::dump_pool_stats_full(
 }
 
 void PGMapDigest::dump_cluster_stats(stringstream *ss,
-				     Formatter *f,
+				     ceph::Formatter *f,
 				     bool verbose) const
 {
   if (f) {
@@ -879,7 +889,7 @@ void PGMapDigest::dump_cluster_stats(stringstream *ss,
 }
 
 void PGMapDigest::dump_object_stat_sum(
-  TextTable &tbl, Formatter *f,
+  TextTable &tbl, ceph::Formatter *f,
   const pool_stat_t &pool_stat, uint64_t avail,
   float raw_used_rate, bool verbose, bool per_pool,
   const pg_pool_t *pool)
@@ -1028,7 +1038,7 @@ void PGMap::get_rules_avail(const OSDMap& osdmap,
 // ---------------------
 // PGMap
 
-void PGMap::Incremental::dump(Formatter *f) const
+void PGMap::Incremental::dump(ceph::Formatter *f) const
 {
   f->dump_unsigned("version", version);
   f->dump_stream("stamp") << stamp;
@@ -1133,14 +1143,16 @@ void PGMap::apply_incremental(CephContext *cct, const Incremental& inc)
 
     auto pool_statfs_iter =
       pool_statfs.find(std::make_pair(update_pool, update_osd));
-    pool_stat_t &pool_sum_ref = pg_pool_sum[update_pool];
-    if (pool_statfs_iter == pool_statfs.end()) {
-      pool_statfs.emplace(std::make_pair(update_pool, update_osd), statfs_inc);
-    } else {
-      pool_sum_ref.sub(pool_statfs_iter->second);
-      pool_statfs_iter->second = statfs_inc;
+    if (pg_pool_sum.count(update_pool)) { 
+      pool_stat_t &pool_sum_ref = pg_pool_sum[update_pool];
+      if (pool_statfs_iter == pool_statfs.end()) {
+        pool_statfs.emplace(std::make_pair(update_pool, update_osd), statfs_inc);
+      } else {
+        pool_sum_ref.sub(pool_statfs_iter->second);
+        pool_statfs_iter->second = statfs_inc;
+      }
+      pool_sum_ref.add(statfs_inc);
     }
-    pool_sum_ref.add(statfs_inc);
   }
 
   for (auto p = inc.get_osd_stat_updates().begin();
@@ -1483,15 +1495,15 @@ void PGMap::decode(bufferlist::const_iterator &bl)
   calc_stats();
 }
 
-void PGMap::dump(Formatter *f) const
+void PGMap::dump(ceph::Formatter *f, bool with_net) const
 {
   dump_basic(f);
   dump_pg_stats(f, false);
   dump_pool_stats(f);
-  dump_osd_stats(f);
+  dump_osd_stats(f, with_net);
 }
 
-void PGMap::dump_basic(Formatter *f) const
+void PGMap::dump_basic(ceph::Formatter *f) const
 {
   f->dump_unsigned("version", version);
   f->dump_stream("stamp") << stamp;
@@ -1509,7 +1521,7 @@ void PGMap::dump_basic(Formatter *f) const
   dump_delta(f);
 }
 
-void PGMap::dump_delta(Formatter *f) const
+void PGMap::dump_delta(ceph::Formatter *f) const
 {
   f->open_object_section("pg_stats_delta");
   pg_sum_delta.dump(f);
@@ -1517,7 +1529,7 @@ void PGMap::dump_delta(Formatter *f) const
   f->close_section();
 }
 
-void PGMap::dump_pg_stats(Formatter *f, bool brief) const
+void PGMap::dump_pg_stats(ceph::Formatter *f, bool brief) const
 {
   f->open_array_section("pg_stats");
   for (auto i = pg_stat.begin();
@@ -1534,7 +1546,7 @@ void PGMap::dump_pg_stats(Formatter *f, bool brief) const
   f->close_section();
 }
 
-void PGMap::dump_pool_stats(Formatter *f) const
+void PGMap::dump_pool_stats(ceph::Formatter *f) const
 {
   f->open_array_section("pool_stats");
   for (auto p = pg_pool_sum.begin();
@@ -1551,7 +1563,7 @@ void PGMap::dump_pool_stats(Formatter *f) const
   f->close_section();
 }
 
-void PGMap::dump_osd_stats(Formatter *f) const
+void PGMap::dump_osd_stats(ceph::Formatter *f, bool with_net) const
 {
   f->open_array_section("osd_stats");
   for (auto q = osd_stat.begin();
@@ -1559,7 +1571,19 @@ void PGMap::dump_osd_stats(Formatter *f) const
        ++q) {
     f->open_object_section("osd_stat");
     f->dump_int("osd", q->first);
-    q->second.dump(f);
+    q->second.dump(f, with_net);
+    f->close_section();
+  }
+  f->close_section();
+}
+
+void PGMap::dump_osd_ping_times(ceph::Formatter *f) const
+{
+  f->open_array_section("osd_ping_times");
+  for (auto& [osd, stat] : osd_stat) {
+    f->open_object_section("osd_ping_time");
+    f->dump_int("osd", osd);
+    stat.dump_ping_time(f);
     f->close_section();
   }
   f->close_section();
@@ -1921,7 +1945,7 @@ bool PGMap::get_stuck_counts(const utime_t cutoff, map<string, int>& note) const
   return inactive || unclean || undersized || degraded || stale;
 }
 
-void PGMap::dump_stuck(Formatter *f, int types, utime_t cutoff) const
+void PGMap::dump_stuck(ceph::Formatter *f, int types, utime_t cutoff) const
 {
   mempool::pgmap::unordered_map<pg_t, pg_stat_t> stuck_pg_stats;
   get_stuck_stats(types, cutoff, stuck_pg_stats);
@@ -1947,7 +1971,7 @@ void PGMap::dump_stuck_plain(ostream& ss, int types, utime_t cutoff) const
 
 int PGMap::dump_stuck_pg_stats(
   stringstream &ds,
-  Formatter *f,
+  ceph::Formatter *f,
   int threshold,
   vector<string>& args) const
 {
@@ -1983,7 +2007,7 @@ int PGMap::dump_stuck_pg_stats(
   return 0;
 }
 
-void PGMap::dump_osd_perf_stats(Formatter *f) const
+void PGMap::dump_osd_perf_stats(ceph::Formatter *f) const
 {
   f->open_array_section("osd_perf_infos");
   for (auto i = osd_stat.begin();
@@ -2017,7 +2041,7 @@ void PGMap::print_osd_perf_stats(std::ostream *ss) const
   (*ss) << tab;
 }
 
-void PGMap::dump_osd_blocked_by_stats(Formatter *f) const
+void PGMap::dump_osd_blocked_by_stats(ceph::Formatter *f) const
 {
   f->open_array_section("osd_blocked_by_infos");
   for (auto i = blocked_by_sum.begin();
@@ -2192,7 +2216,7 @@ void PGMap::get_filtered_pg_stats(uint64_t state, int64_t poolid, int64_t osdid,
   }
 }
 
-void PGMap::dump_filtered_pg_stats(Formatter *f, set<pg_t>& pgs) const
+void PGMap::dump_filtered_pg_stats(ceph::Formatter *f, set<pg_t>& pgs) const
 {
   f->open_array_section("pg_stats");
   for (auto i = pgs.begin(); i != pgs.end(); ++i) {
@@ -2261,7 +2285,7 @@ void PGMap::dump_filtered_pg_stats(ostream& ss, set<pg_t>& pgs) const
 }
 
 void PGMap::dump_pool_stats_and_io_rate(int64_t poolid, const OSDMap &osd_map,
-                                        Formatter *f,
+                                        ceph::Formatter *f,
                                         stringstream *rs) const {
   string pool_name = osd_map.get_pool_name(poolid);
   if (f) {
@@ -2331,10 +2355,11 @@ void PGMap::get_health_checks(
   typedef enum pg_consequence_t {
     UNAVAILABLE = 1,   // Client IO to the pool may block
     DEGRADED = 2,      // Fewer than the requested number of replicas are present
-    DEGRADED_FULL = 3, // Fewer than the request number of replicas may be present
-                       //  and insufficiet resources are present to fix this
-    DAMAGED = 4        // The data may be missing or inconsistent on disk and
+    BACKFILL_FULL = 3, // Backfill is blocked for space considerations
+                       // This may or may not be a deadlock condition.
+    DAMAGED = 4,        // The data may be missing or inconsistent on disk and
                        //  requires repair
+    RECOVERY_FULL = 5  // Recovery is blocked because OSDs are full
   } pg_consequence_t;
 
   // For a given PG state, how should it be reported at the pool level?
@@ -2377,8 +2402,8 @@ void PGMap::get_health_checks(
     { PG_STATE_SNAPTRIM_ERROR,   {DAMAGED,     {}} },
     { PG_STATE_RECOVERY_UNFOUND, {DAMAGED,     {}} },
     { PG_STATE_BACKFILL_UNFOUND, {DAMAGED,     {}} },
-    { PG_STATE_BACKFILL_TOOFULL, {DEGRADED_FULL, {}} },
-    { PG_STATE_RECOVERY_TOOFULL, {DEGRADED_FULL, {}} },
+    { PG_STATE_BACKFILL_TOOFULL, {BACKFILL_FULL, {}} },
+    { PG_STATE_RECOVERY_TOOFULL, {RECOVERY_FULL, {}} },
     { PG_STATE_DEGRADED,         {DEGRADED,    {}} },
     { PG_STATE_DOWN,             {UNAVAILABLE, {}} },
     // Delayed (wait until stuck) reports
@@ -2522,14 +2547,19 @@ void PGMap::get_health_checks(
         summary = "Degraded data redundancy: ";
         sev = HEALTH_WARN;
         break;
-      case DEGRADED_FULL:
-        health_code = "PG_DEGRADED_FULL";
-        summary = "Degraded data redundancy (low space): ";
-        sev = HEALTH_ERR;
+      case BACKFILL_FULL:
+        health_code = "PG_BACKFILL_FULL";
+        summary = "Low space hindering backfill (add storage if this doesn't resolve itself): ";
+        sev = HEALTH_WARN;
         break;
       case DAMAGED:
         health_code = "PG_DAMAGED";
         summary = "Possible data damage: ";
+        sev = HEALTH_ERR;
+        break;
+      case RECOVERY_FULL:
+        health_code = "PG_RECOVERY_FULL";
+        summary = "Full OSDs blocking recovery: ";
         sev = HEALTH_ERR;
         break;
       default:
@@ -2691,6 +2721,129 @@ void PGMap::get_health_checks(
       ss << "too many PGs per OSD (" << per
 	 << " > max " << max_pg_per_osd << ")";
       checks->add("TOO_MANY_PGS", HEALTH_WARN, ss.str());
+    }
+  }
+
+  // TOO_FEW_OSDS
+  auto warn_too_few_osds = cct->_conf.get_val<bool>("mon_warn_on_too_few_osds");
+  auto osd_pool_default_size = cct->_conf.get_val<uint64_t>("osd_pool_default_size");
+  if (warn_too_few_osds && osdmap.get_num_osds() < osd_pool_default_size) {
+    ostringstream ss;
+    ss << "OSD count " << osdmap.get_num_osds()
+	 << " < osd_pool_default_size " << osd_pool_default_size;
+    checks->add("TOO_FEW_OSDS", HEALTH_WARN, ss.str());
+  }
+
+  // SLOW_PING_TIME
+  // Convert milliseconds to microseconds
+  auto warn_slow_ping_time = cct->_conf.get_val<double>("mon_warn_on_slow_ping_time") * 1000;
+  auto grace = cct->_conf.get_val<int64_t>("osd_heartbeat_grace");
+  if (warn_slow_ping_time == 0) {
+    double ratio = cct->_conf.get_val<double>("mon_warn_on_slow_ping_ratio");
+    warn_slow_ping_time = grace;
+    warn_slow_ping_time *= 1000000 * ratio; // Seconds of grace to microseconds at ratio
+  }
+  if (warn_slow_ping_time > 0) {
+
+    struct mon_ping_item_t {
+      uint32_t pingtime;
+      int from;
+      int to;
+      bool improving;
+
+      bool operator<(const mon_ping_item_t& rhs) const {
+        if (pingtime < rhs.pingtime)
+          return true;
+        if (pingtime > rhs.pingtime)
+          return false;
+        if (from < rhs.from)
+          return true;
+        if (from > rhs.from)
+          return false;
+        return to < rhs.to;
+      }
+    };
+
+    list<string> detail_back;
+    list<string> detail_front;
+    set<mon_ping_item_t> back_sorted, front_sorted;
+    for (auto i : osd_stat) {
+      for (auto j : i.second.hb_pingtime) {
+
+	// Maybe source info is old
+	if (now.sec() - j.second.last_update > grace * 60)
+	  continue;
+
+	mon_ping_item_t back;
+	back.pingtime = std::max(j.second.back_pingtime[0], j.second.back_pingtime[1]);
+	back.pingtime = std::max(back.pingtime, j.second.back_pingtime[2]);
+	back.from = i.first;
+	back.to = j.first;
+	if (back.pingtime > warn_slow_ping_time) {
+	  back.improving = (j.second.back_pingtime[0] < j.second.back_pingtime[1]
+			    && j.second.back_pingtime[1] < j.second.back_pingtime[2]);
+	  back_sorted.emplace(back);
+	}
+
+	mon_ping_item_t front;
+	front.pingtime = std::max(j.second.front_pingtime[0], j.second.front_pingtime[1]);
+	front.pingtime = std::max(front.pingtime, j.second.front_pingtime[2]);
+	front.from = i.first;
+	front.to = j.first;
+	if (front.pingtime > warn_slow_ping_time) {
+	  front.improving = (j.second.front_pingtime[0] < j.second.front_pingtime[1]
+			     && j.second.front_pingtime[1] < j.second.back_pingtime[2]);
+	  front_sorted.emplace(front);
+	}
+      }
+    }
+    int max_detail = 10;
+    for (auto &sback : boost::adaptors::reverse(back_sorted)) {
+      ostringstream ss;
+      if (max_detail == 0) {
+	ss << "Truncated long network list.  Use ceph daemon mgr.# dump_osd_network for more information";
+        detail_back.push_back(ss.str());
+        break;
+      }
+      max_detail--;
+      ss << "Slow heartbeat ping on back interface from osd." << sback.from
+         << (osdmap.is_down(sback.from) ? " (down)" : "")
+	 << " to osd." << sback.to
+         << (osdmap.is_down(sback.to) ? " (down)" : "")
+	 << " " << fixed_u_to_string(sback.pingtime, 3) << " msec"
+	 << (sback.improving ? " possibly improving" : "");
+      detail_back.push_back(ss.str());
+    }
+    max_detail = 10;
+    for (auto &sfront : boost::adaptors::reverse(front_sorted)) {
+      ostringstream ss;
+      if (max_detail == 0) {
+	ss << "Truncated long network list.  Use ceph daemon mgr.# dump_osd_network for more information";
+        detail_front.push_back(ss.str());
+        break;
+      }
+      max_detail--;
+      ss << "Slow heartbeat ping on front interface from osd." << sfront.from
+         << (osdmap.is_down(sfront.from) ? " (down)" : "")
+         << " to osd." << sfront.to
+         << (osdmap.is_down(sfront.to) ? " (down)" : "")
+	 << " " << fixed_u_to_string(sfront.pingtime, 3) << " msec"
+	 << (sfront.improving ? " possibly improving" : "");
+      detail_front.push_back(ss.str());
+    }
+    if (detail_back.size() != 0) {
+      ostringstream ss;
+      ss << "Long heartbeat ping times on back interface seen, longest is "
+	 << fixed_u_to_string(back_sorted.rbegin()->pingtime, 3) << " msec";
+      auto& d = checks->add("OSD_SLOW_PING_TIME_BACK", HEALTH_WARN, ss.str());
+      d.detail.swap(detail_back);
+    }
+    if (detail_front.size() != 0) {
+      ostringstream ss;
+      ss << "Long heartbeat ping times on front interface seen, longest is "
+	 << fixed_u_to_string(front_sorted.rbegin()->pingtime, 3) << " msec";
+      auto& d = checks->add("OSD_SLOW_PING_TIME_FRONT", HEALTH_WARN, ss.str());
+      d.detail.swap(detail_front);
     }
   }
 
@@ -3198,7 +3351,7 @@ int process_pg_map_command(
   const cmdmap_t& orig_cmdmap,
   const PGMap& pg_map,
   const OSDMap& osdmap,
-  Formatter *f,
+  ceph::Formatter *f,
   stringstream *ss,
   bufferlist *odata)
 {
@@ -3656,7 +3809,7 @@ int reweight::by_utilization(
     mempool::osdmap::map<int32_t, uint32_t>* new_weights,
     std::stringstream *ss,
     std::string *out_str,
-    Formatter *f)
+    ceph::Formatter *f)
 {
   if (oload <= 100) {
     *ss << "You must give a percentage higher than 100. "

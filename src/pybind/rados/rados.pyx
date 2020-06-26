@@ -573,7 +573,7 @@ cdef size_t * to_csize_t_array(list_int):
     cdef size_t *ret = <size_t *>malloc(len(list_int) * sizeof(size_t))
     if ret == NULL:
         raise MemoryError("malloc failed")
-    for i in xrange(len(list_int)):
+    for i in range(len(list_int)):
         ret[i] = <size_t>list_int[i]
     return ret
 
@@ -582,7 +582,7 @@ cdef char ** to_bytes_array(list_bytes):
     cdef char **ret = <char **>malloc(len(list_bytes) * sizeof(char *))
     if ret == NULL:
         raise MemoryError("malloc failed")
-    for i in xrange(len(list_bytes)):
+    for i in range(len(list_bytes)):
         ret[i] = <char *>list_bytes[i]
     return ret
 
@@ -3365,12 +3365,14 @@ returned %d, but should return zero on success." % (self.name, ret))
             raise Error("Rados(): keys and values must have the same number of items")
 
         keys = cstr_list(keys, 'keys')
+        values = cstr_list(values, 'values')
+        lens = [len(v) for v in values]
         cdef:
             WriteOp _write_op = write_op
             size_t key_num = len(keys)
             char **_keys = to_bytes_array(keys)
             char **_values = to_bytes_array(values)
-            size_t *_lens = to_csize_t_array([len(v) for v in values])
+            size_t *_lens = to_csize_t_array(lens)
 
         try:
             with nogil:

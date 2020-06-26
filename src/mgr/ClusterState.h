@@ -50,15 +50,14 @@ protected:
   bufferlist health_json;
   bufferlist mon_status_json;
 
+  class ClusterSocketHook *asok_hook;
+
 public:
 
   void load_digest(MMgrDigest *m);
   void ingest_pgstats(MPGStats *stats);
 
   void update_delta_stats();
-
-  const bufferlist &get_health() const {return health_json;}
-  const bufferlist &get_mon_status() const {return mon_status_json;}
 
   ClusterState(MonClient *monc_, Objecter *objecter_, const MgrMap& mgrmap);
 
@@ -138,6 +137,24 @@ public:
       std::forward<Args>(args)...);
   }
 
+  template<typename Callback, typename...Args>
+  void with_health(Callback&& cb, Args&&...args) const
+  {
+    std::lock_guard l(lock);
+    std::forward<Callback>(cb)(health_json, std::forward<Args>(args)...);
+  }
+
+  template<typename Callback, typename...Args>
+  void with_mon_status(Callback&& cb, Args&&...args) const
+  {
+    std::lock_guard l(lock);
+    std::forward<Callback>(cb)(mon_status_json, std::forward<Args>(args)...);
+  }
+
+  void final_init();
+  void shutdown();
+  bool asok_command(std::string_view admin_command, const cmdmap_t& cmdmap,
+		       std::string_view format, ostream& ss);
 };
 
 #endif

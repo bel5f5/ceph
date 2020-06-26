@@ -199,6 +199,22 @@ PyObject *ActivePyModules::get_python(const std::string &what)
       }
     });
     return f.get();
+  } else if (what == "modified_config_options") {
+    PyEval_RestoreThread(tstate);
+    auto all_daemons = daemon_state.get_all();
+    set<string> names;
+    for (auto& [key, daemon] : all_daemons) {
+      std::lock_guard l(daemon->lock);
+      for (auto& [name, valmap] : daemon->config) {
+	names.insert(name);
+      }
+    }
+    f.open_array_section("options");
+    for (auto& name : names) {
+      f.dump_string("name", name);
+    }
+    f.close_section();
+    return f.get();
   } else if (what.substr(0, 6) == "config") {
     PyEval_RestoreThread(tstate);
     if (what == "config_options") {
@@ -296,7 +312,7 @@ PyObject *ActivePyModules::get_python(const std::string &what)
     cluster_state.with_pgmap(
       [&f, &tstate](const PGMap &pg_map) {
         PyEval_RestoreThread(tstate);
-	pg_map.dump(&f);
+	pg_map.dump(&f, false);
       }
     );
     return f.get();
@@ -314,10 +330,15 @@ PyObject *ActivePyModules::get_python(const std::string &what)
   } else if (what.size() > 7 &&
 	     what.substr(0, 7) == "device ") {
     string devid = what.substr(7);
-    daemon_state.with_device(devid, [&f, &tstate] (const DeviceState& dev) {
-        PyEval_RestoreThread(tstate);
-	f.dump_object("device", dev);
-      });
+    if (!daemon_state.with_device(
+	  devid,
+	  [&f, &tstate] (const DeviceState& dev) {
+	    PyEval_RestoreThread(tstate);
+	    f.dump_object("device", dev);
+	  })) {
+      // device not found
+      PyEval_RestoreThread(tstate);
+    }
     return f.get();
   } else if (what == "io_rate") {
     cluster_state.with_pgmap(
@@ -337,11 +358,36 @@ PyObject *ActivePyModules::get_python(const std::string &what)
         pg_map.dump_pool_stats_full(osd_map, nullptr, &f, true);
       });
     return f.get();
+  } else if (what == "pg_stats") {
+    cluster_state.with_pgmap(
+        [&f, &tstate](const PGMap &pg_map) {
+      PyEval_RestoreThread(tstate);
+      pg_map.dump_pg_stats(&f, false);
+    });
+    return f.get();
+  } else if (what == "pool_stats") {
+    cluster_state.with_pgmap(
+        [&f, &tstate](const PGMap &pg_map) {
+      PyEval_RestoreThread(tstate);
+      pg_map.dump_pool_stats(&f);
+    });
+    return f.get();
+  } else if (what == "pg_ready") {
+    PyEval_RestoreThread(tstate);
+    server.dump_pg_ready(&f);
+    return f.get();
   } else if (what == "osd_stats") {
     cluster_state.with_pgmap(
         [&f, &tstate](const PGMap &pg_map) {
       PyEval_RestoreThread(tstate);
-      pg_map.dump_osd_stats(&f);
+      pg_map.dump_osd_stats(&f, false);
+    });
+    return f.get();
+  } else if (what == "osd_ping_times") {
+    cluster_state.with_pgmap(
+        [&f, &tstate](const PGMap &pg_map) {
+      PyEval_RestoreThread(tstate);
+      pg_map.dump_osd_ping_times(&f);
     });
     return f.get();
   } else if (what == "osd_pool_stats") {
@@ -358,18 +404,19 @@ PyObject *ActivePyModules::get_python(const std::string &what)
         f.close_section();
     });
     return f.get();
-  } else if (what == "health" || what == "mon_status") {
-    bufferlist json;
-    if (what == "health") {
-      json = cluster_state.get_health();
-    } else if (what == "mon_status") {
-      json = cluster_state.get_mon_status();
-    } else {
-      ceph_abort();
-    }
-
-    PyEval_RestoreThread(tstate);
-    f.dump_string("json", json.to_str());
+  } else if (what == "health") {
+    cluster_state.with_health(
+        [&f, &tstate](const ceph::bufferlist &health_json) {
+      PyEval_RestoreThread(tstate);
+      f.dump_string("json", health_json.to_str());
+    });
+    return f.get();
+  } else if (what == "mon_status") {
+    cluster_state.with_mon_status(
+        [&f, &tstate](const ceph::bufferlist &mon_status_json) {
+      PyEval_RestoreThread(tstate);
+      f.dump_string("json", mon_status_json.to_str());
+    });
     return f.get();
   } else if (what == "mgr_map") {
     cluster_state.with_mgrmap([&f, &tstate](const MgrMap &mgr_map) {
@@ -904,22 +951,24 @@ void ActivePyModules::set_health_checks(const std::string& module_name,
 }
 
 int ActivePyModules::handle_command(
-  std::string const &module_name,
+  const ModuleCommand& module_command,
+  const MgrSession& session,
   const cmdmap_t &cmdmap,
   const bufferlist &inbuf,
   std::stringstream *ds,
   std::stringstream *ss)
 {
-  lock.Lock();
-  auto mod_iter = modules.find(module_name);
+  lock.lock();
+  auto mod_iter = modules.find(module_command.module_name);
   if (mod_iter == modules.end()) {
-    *ss << "Module '" << module_name << "' is not available";
-    lock.Unlock();
+    *ss << "Module '" << module_command.module_name << "' is not available";
+    lock.unlock();
     return -ENOENT;
   }
 
-  lock.Unlock();
-  return mod_iter->second->handle_command(cmdmap, inbuf, ds, ss);
+  lock.unlock();
+  return mod_iter->second->handle_command(module_command, session, cmdmap,
+                                          inbuf, ds, ss);
 }
 
 void ActivePyModules::get_health_checks(health_check_map_t *checks)

@@ -413,6 +413,57 @@ class Option(dict):
             (k, v) for k, v in vars().items()
             if k != 'self' and v is not None)
 
+class Command(dict):
+    """
+    Helper class to declare options for COMMANDS list.
+
+    It also allows to specify prefix and args separately, as well as storing a
+    handler callable.
+
+    Usage:
+    >>> Command(prefix="example",
+    ...         args="name=arg,type=CephInt",
+    ...         perm='w',
+    ...         desc="Blah")
+    {'poll': False, 'cmd': 'example name=arg,type=CephInt', 'perm': 'w', 'desc': 'Blah'}
+    """
+
+    def __init__(
+            self,
+            prefix,
+            args=None,
+            perm="rw",
+            desc=None,
+            poll=False,
+            handler=None
+    ):
+        super(Command, self).__init__(
+            cmd=prefix + (' ' + args if args else ''),
+            perm=perm,
+            desc=desc,
+            poll=poll)
+        self.prefix = prefix
+        self.args = args
+        self.handler = handler
+
+    def register(self, instance=False):
+        """
+        Register a CLICommand handler. It allows an instance to register bound
+        methods. In that case, the mgr instance is not passed, and it's expected
+        to be available in the class instance.
+        It also uses HandleCommandResult helper to return a wrapped a tuple of 3
+        items.
+        """
+        return CLICommand(
+            prefix=self.prefix,
+            args=self.args,
+            desc=self['desc'],
+            perm=self['perm']
+        )(
+            func=lambda mgr, *args, **kwargs: HandleCommandResult(*self.handler(
+                *((instance or mgr,) + args), **kwargs))
+        )
+
 
 class MgrStandbyModule(ceph_module.BaseMgrStandbyModule):
     """
@@ -584,6 +635,15 @@ class MgrModule(ceph_module.BaseMgrModule):
     def version(self):
         return self._version
 
+    @property
+    def release_name(self):
+        """
+        Get the release name of the Ceph version, e.g. 'nautilus' or 'octopus'.
+        :return: Returns the release name of the Ceph version in lower case.
+        :rtype: str
+        """
+        return self._ceph_get_release_name()
+
     def get_context(self):
         """
         :return: a Python capsule containing a C++ CephContext pointer
@@ -641,7 +701,8 @@ class MgrModule(ceph_module.BaseMgrModule):
         :param str data_name: Valid things to fetch are osd_crush_map_text,
                 osd_map, osd_map_tree, osd_map_crush, config, mon_map, fs_map,
                 osd_metadata, pg_summary, io_rate, pg_dump, df, osd_stats,
-                health, mon_status, devices, device <devid>.
+                health, mon_status, devices, device <devid>, pg_stats,
+                pool_stats, pg_ready, osd_ping_times.
 
         Note:
             All these structures have their own JSON representations: experiment
@@ -1017,7 +1078,8 @@ class MgrModule(ceph_module.BaseMgrModule):
         return self._get_module_option(key, default, self.get_mgr_id())
 
     def _set_module_option(self, key, val):
-        return self._ceph_set_module_option(self.module_name, key, str(val))
+        return self._ceph_set_module_option(self.module_name, key,
+                                            None if val is None else str(val))
 
     def set_module_option(self, key, val):
         """
@@ -1316,6 +1378,17 @@ class MgrModule(ceph_module.BaseMgrModule):
         :param int query_id: query ID
         """
         return self._ceph_get_osd_perf_counters(query_id)
+
+    def is_authorized(self, arguments):
+        """
+        Verifies that the current session caps permit executing the py service
+        or current module with the provided arguments. This provides a generic
+        way to allow modules to restrict by more fine-grained controls (e.g.
+        pools).
+
+        :param arguments: dict of key/value arguments to test
+        """
+        return self._ceph_is_authorized(arguments)
 
 
 class PersistentStoreDict(object):
